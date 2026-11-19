@@ -65,8 +65,12 @@ def maybe_download_nlohmann_json():
 
 INCLUDE_DIRS = [
     CSRC_DIR,
-    # Vendored cxx 1.0.145 header (rust/cxx.h): the cxx bridge types
-    # (rust::Box, rust::Slice, rust::Error) the csrc consumes.
+    # Vendored cxx header (rust/cxx.h), version-matched to the spyre-torch
+    # crate's cxx pin (=1.0.205): the cxx bridge types (rust::Box,
+    # rust::Slice, rust::Error) the csrc consumes. Stub-phase only: once
+    # spyre-torch phase 2 lands, the csrc includes cxx.h and the GENERATED
+    # bridge header from the crate's build output instead, and this copy and
+    # the hand-written spyre_rt.h mirror go away.
     CSRC_DIR / "external" / "cxx" / "include",
     # "tracy/public"
 ]

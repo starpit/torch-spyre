@@ -1098,51 +1098,24 @@ PYBIND11_MODULE(_C, m) {
       "bytes.");
 #endif  // TORCH_SPYRE_FLEX
 
+#ifdef TORCH_SPYRE_FLEX
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can verify what each correction slot resolves to without
-  // needing a live HCM or device execution. Returns one integer per slot. An
-  // address slot gives a deterministic digest of its view (region, offset,
-  // size), so the same tensor yields the same integer and a different tensor a
-  // different one. A value slot (a dimension, or a shard's resolved device
-  // address) gives the value itself. Any ordering bug inside
-  // resolveSymbolicArgs is therefore visible as a mismatched int vector.
-  // The "_" prefix signals this is not part of the stable public API.
+  // that Python tests can verify the HostComputeArg ordering without needing
+  // a live HCM or device execution. Debug binding, flex-only: the resolved
+  // values are typed spyre_rt::HostComputeArg (an enum-tagged view or value),
+  // and the runtime exposes no address integer to project them onto.
   m.def(
       "_resolve_symbolic_args",
-      [](const std::vector<at::Tensor>& tensors,
-         const std::vector<spyre::SymbolicArg>& symbolic_args) {
-        const auto resolved =
-            spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
-                                                               symbolic_args);
-        std::vector<int64_t> values;
-        values.reserve(resolved.size());
-        for (const auto& host_arg : resolved) {
-          if (host_arg.kind == spyre_rt::HostComputeArgKind::Value) {
-            values.push_back(host_arg.value);
-          } else {
-            // Deterministic digest of the resolved view: mix region, offset
-            // and size (FNV-1a). Distinct allocations collide only by hash
-            // accident, which is enough for ordering tests.
-            uint64_t h = 1469598103934665603ULL;
-            auto mix = [&h](uint64_t x) {
-              for (int i = 0; i < 8; ++i) {
-                h ^= (x >> (8 * i)) & 0xff;
-                h *= 1099511628211ULL;
-              }
-            };
-            mix(host_arg.view.region.raw);
-            mix(host_arg.view.offset.raw);
-            mix(host_arg.view.size.raw);
-            values.push_back(static_cast<int64_t>(h));
-          }
-        }
-        return values;
+      [](const std::vector<at::Tensor>&,
+         const std::vector<spyre::SymbolicArg>&) {
+        TORCH_CHECK(false,
+                    "_resolve_symbolic_args is not ported to the spyre_rt "
+                    "runtime (no address integers to return)");
       },
       py::arg("tensors"), py::arg("symbolic_args"),
-      "Test-only: resolve a symbolic_args payload to a list of integers, one "
-      "per slot. An address slot gives a digest of its view and a value slot "
-      "(a dimension) gives the value. Same tensor yields the same address "
-      "integer; a different tensor yields a different one.");
+      "Test-only: resolve a symbolic_args payload to a list of device-address "
+      "integers.");
+#endif  // TORCH_SPYRE_FLEX
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
