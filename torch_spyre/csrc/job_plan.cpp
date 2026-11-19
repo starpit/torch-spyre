@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -33,6 +34,16 @@ namespace {
 // The step's pipeline_barrier_ flag mapped onto the bridge enum.
 inline spyre_rt::PipelineBarrier step_barrier(bool enabled) {
   return enabled ? spyre_rt::PipelineBarrier::Yes : spyre_rt::PipelineBarrier::No;
+}
+
+// Debug printing of a DeviceView. to_string is not in the bridge (the API's
+// Display for DeviceView was cut with it), so the operator<< sites format
+// the fields themselves — debug only, never on the launch path.
+std::string view_to_string(const spyre_rt::DeviceView& view) {
+  std::ostringstream os;
+  os << "{region=" << view.region.raw << " offset=" << view.offset.raw
+     << " size=" << view.size.raw << " domain=" << view.domain.raw << "}";
+  return os.str();
 }
 }  // namespace
 
@@ -50,7 +61,7 @@ void JobPlanStepH2D::write(std::ostream& os) const {
   os << "  H2D (Host-to-Device)\n";
   os << "    Host address: " << host_address_ << "\n";
   os << "    Device view: "
-     << std::string(spyre_rt::to_string(device_address_)) << "\n";
+     << std::string(view_to_string(device_address_)) << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
@@ -65,8 +76,8 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
   } else {
     const uint64_t device_ptr = std::get<Dmva>(device_address_).value;
     const spyre_rt::DecodedPointer decoded =
-        spyre_rt::decode_device_pointer(device_ptr);
-    const uint32_t segment_id = decoded.segment;
+        spyre::GlobalRuntime::get()->decode_device_pointer(spyre_rt::DevicePointer{device_ptr});
+    const uint32_t segment_id = decoded.segment.raw;
     const uint64_t segment_offset = decoded.offset.raw;
     TORCH_CHECK(segment_id < ctx.inputs_outputs.size(),
                 "D2H tensor-segment lookup out of range: segment ", segment_id,
@@ -93,7 +104,7 @@ void JobPlanStepD2H::write(std::ostream& os) const {
   os << "  D2H (Device-to-Host)\n";
   if (std::holds_alternative<spyre_rt::DeviceView>(device_address_)) {
     os << "    Device view: "
-       << std::string(spyre_rt::to_string(
+       << std::string(view_to_string(
               std::get<spyre_rt::DeviceView>(device_address_)))
        << "\n";
   } else {
@@ -125,7 +136,7 @@ void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
   os << "    Name: " << (name_.empty() ? "(unnamed)" : name_) << "\n";
   os << "    Program view: "
-     << std::string(spyre_rt::to_string(program_address_)) << "\n";
+     << std::string(view_to_string(program_address_)) << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
@@ -247,7 +258,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
 
   // Enforce that the produced correction size matches the expected device
   // allocation size.
-  TORCH_DCHECK_EQ(spyre_rt::size(*corrections).raw, device_address_.size.raw);
+  TORCH_DCHECK_EQ(corrections->size().raw, device_address_.size.raw);
 
 #ifdef TORCH_SPYRE_FLEX
   // VF-only compound correction submission: PF's maxProgramCorrections() is 0
@@ -271,7 +282,7 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
   os << "    Correction size: " << correction_size_ << " bytes\n";
   os << "    Device address: "
-     << std::string(spyre_rt::to_string(device_address_)) << "\n";
+     << std::string(view_to_string(device_address_)) << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
@@ -283,12 +294,12 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   // Job allocation
   if (!plan.job_allocation.empty()) {
     os << "Job allocation: "
-       << std::string(spyre_rt::to_string(plan.job_allocation.front()->view()))
+       << std::string(view_to_string(plan.job_allocation.front()->view()))
        << "\n";
   }
   for (size_t i = 0; i < plan.program_views.size(); ++i) {
     os << "Program " << i << ": "
-       << std::string(spyre_rt::to_string(plan.program_views[i])) << "\n";
+       << std::string(view_to_string(plan.program_views[i])) << "\n";
   }
 
   // Expected input shapes

@@ -571,7 +571,9 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         "supported.");
     pool.stream_handle_map[sid] = &runtime->create_stream(
         spyre_rt::StreamPriority::Normal, spyre_rt::StreamOrdering::Strict,
-        /*track_hazards=*/get_hazard_tracker_enabled());
+        /*track_hazards=*/get_hazard_tracker_enabled()
+            ? spyre_rt::HazardTracking::Tracked
+            : spyre_rt::HazardTracking::Untracked);
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -724,7 +726,9 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
                      : spyre_rt::StreamPriority::Normal;
     const spyre_rt::Stream* handle = &runtime->create_stream(
         streamPriority, spyre_rt::StreamOrdering::Strict,
-        /*track_hazards=*/get_hazard_tracker_enabled());
+        /*track_hazards=*/get_hazard_tracker_enabled()
+            ? spyre_rt::HazardTracking::Tracked
+            : spyre_rt::HazardTracking::Untracked);
     pool.stream_handle_map[stream_id] = handle;
   }
 

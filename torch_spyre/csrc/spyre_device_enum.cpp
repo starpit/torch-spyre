@@ -25,7 +25,7 @@ int getVisibleDeviceCount() {
   // Behaviour is the vendor flex::getNumDevices() (PF/VF: total devices in the
   // system, adjusted by AIU_WORLD_SIZE and SPYRE_DEVICES; MOCK: AIU_WORLD_SIZE,
   // error when < 1) — now answered by the spyre-torch crate.
-  return static_cast<int>(spyre_rt::num_devices());
+  return static_cast<int>(spyre_rt::num_devices().raw);
 }
 
 }  // namespace spyre

@@ -229,7 +229,7 @@ c10::DataPtr SpyreAllocator::allocateShardedStorage(
               "SpyreAllocator::allocateShardedStorage: the spyre_rt runtime "
               "is not initialized");
 
-  const uint32_t num_domains = runtime->num_domains();
+  const uint32_t num_domains = runtime->num_domains().raw;
 
   // Each shard is its own aligned plain allocation; shard i backs core i by
   // the torch-spyre-owned shard table, bound to Flex memory domain
@@ -334,4 +334,5 @@ void on_memory_pressure() {
 }  // namespace spyre_rt
 
 // Register our custom allocator
-REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
+REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1,
+                  &spyre::SpyreAllocator::instance());

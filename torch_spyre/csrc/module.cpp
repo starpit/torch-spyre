@@ -1244,7 +1244,7 @@ PYBIND11_MODULE(_C, m) {
         TORCH_CHECK(runtime != nullptr,
                     "num_memory_domains requires the spyre_rt runtime to be "
                     "initialized");
-        return runtime->num_domains();
+        return runtime->num_domains().raw;
       },
       "Number of memory domains in the device topology.");
 

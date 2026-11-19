@@ -30,6 +30,7 @@
 #include "job_plan.h"
 #include "kernel_provenance_registry.h"
 #include "logging.h"
+#include "module.h"
 #include "spyre_allocator.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
@@ -95,7 +96,7 @@ static spyre_rt::DeviceView compute_offset_address(
     const spyre_rt::DeviceView& job_allocation, uint64_t dev_ptr,
     size_t size = 0) {
   const spyre_rt::DecodedPointer decoded =
-      spyre_rt::decode_device_pointer(dev_ptr);
+      spyre::GlobalRuntime::get()->decode_device_pointer(spyre_rt::DevicePointer{dev_ptr});
   // Validate device pointer is within program segment bounds
   TORCH_CHECK(decoded.memory_type == spyre_rt::MemoryType::Program,
               "Device pointer 0x", std::hex, dev_ptr, " has memory type ",
@@ -363,7 +364,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   }
 
   const spyre_rt::DecodedPointer decoded =
-      spyre_rt::decode_device_pointer(job_bin_ptr);
+      spyre::GlobalRuntime::get()->decode_device_pointer(spyre_rt::DevicePointer{job_bin_ptr});
 
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in
@@ -596,7 +597,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       // in JobPlanStepD2H. If device_ptr is in tensor segments, store
       // device_ptr
       const spyre_rt::DecodedPointer decoded =
-          spyre_rt::decode_device_pointer(device_ptr);
+          spyre::GlobalRuntime::get()->decode_device_pointer(spyre_rt::DevicePointer{device_ptr});
       if (decoded.memory_type == spyre_rt::MemoryType::Program) {
         // Compute the program's view with offset
         spyre_rt::DeviceView comp_addr = compute_offset_address(
