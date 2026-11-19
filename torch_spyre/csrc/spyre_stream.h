@@ -86,7 +86,7 @@ class SpyreStream {
   void copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                      const spyre_rt::DeviceView* device_address,
                      const DataConversionInfo* dci, bool host2device,
-                     std::unique_ptr<spyre::HostKeepAlive> keep = nullptr) const;
+                     std::unique_ptr<spyre_rt::HostKeepAlive> keep = nullptr) const;
 };
 
 /**

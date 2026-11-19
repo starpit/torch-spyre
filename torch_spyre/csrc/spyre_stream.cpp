@@ -337,7 +337,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
         // to own the underlying allocation, just as in the full-storage
         // path.
         copyAsyncImpl(cpu_ptr, host_capacity, &*range, &dci, host2device,
-                      std::make_unique<spyre::HostKeepAlive>(
+                      std::make_unique<spyre::StorageKeepAlive>(
                           cpu_tensor->storage()));
         return;
       }
@@ -351,9 +351,9 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // c10::Storage rather than at::Tensor: a tensor copy shares the
     // TensorImpl, which resize_/set_ mutate in place by swapping in a new
     // storage -- the old pages would be freed under the in-flight DMA.
-    std::unique_ptr<spyre::HostKeepAlive> keep;
+    std::unique_ptr<spyre_rt::HostKeepAlive> keep;
     if (device2host || dci_arg == nullptr) {
-      keep = std::make_unique<spyre::HostKeepAlive>(cpu_tensor->storage());
+      keep = std::make_unique<spyre::StorageKeepAlive>(cpu_tensor->storage());
     }
     copyAsyncImpl(cpu_ptr, host_capacity, allocation, dci_arg, host2device,
                   std::move(keep));
@@ -391,7 +391,7 @@ void SpyreStream::copyAsyncImpl(
     void* cpu_ptr, size_t host_capacity,
     const spyre_rt::DeviceView* device_address, const DataConversionInfo* dci,
     bool host2device,
-    std::unique_ptr<spyre::HostKeepAlive> keep) const {
+    std::unique_ptr<spyre_rt::HostKeepAlive> keep) const {
   // The vendor's pageable path: createDmaParamsWithHostCapacity semantics
   // (the caller states the accessible host extent; the runtime bounds the
   // DMA and, on D2H with a DCI, bounds the conversion output by it). The

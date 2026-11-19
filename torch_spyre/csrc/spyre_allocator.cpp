@@ -295,6 +295,9 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   // do nothing -- look into when this is called
 }
 
+// device_address is not in the spyre_rt bridge (sharded path only); the
+// translation stays with the rest of the sharded surface under the ifdef.
+#ifdef TORCH_SPYRE_FLEX
 uint64_t SpyreAllocator::compositeAddressToDeviceAddress(
     const spyre_rt::DeviceView& view) const {
   auto* runtime = GlobalRuntime::get();
@@ -303,11 +306,17 @@ uint64_t SpyreAllocator::compositeAddressToDeviceAddress(
               "initialized");
   return runtime->device_address(view);
 }
+#endif  // TORCH_SPYRE_FLEX
+
+}  // namespace spyre
 
 // The vendor's FlexAllocator memory-pressure callback (flex_allocator.cpp
 // allocateInDomain): the Rust allocator calls this WITHOUT its lock held;
 // it releases nothing itself, runs the Python GC, and returns. Retry
-// semantics stay in the Rust allocator.
+// semantics stay in the Rust allocator. Declared by the crate's
+// include/spyre_torch.h in namespace spyre_rt (the bridge's one call back
+// into its consumer); the link fails by name without this definition.
+namespace spyre_rt {
 void on_memory_pressure() {
   SPYRE_RUNTIME_DEBUG() << "memory pressure: acquiring Python GIL for "
                            "garbage collection";
@@ -322,8 +331,7 @@ void on_memory_pressure() {
   PyGILState_Release(gstate);
   SPYRE_RUNTIME_DEBUG() << "memory pressure callback complete";
 }
+}  // namespace spyre_rt
 
 // Register our custom allocator
 REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
-
-}  // namespace spyre

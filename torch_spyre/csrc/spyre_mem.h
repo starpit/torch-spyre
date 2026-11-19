@@ -130,13 +130,16 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 // Whether `tensor`'s storage is sharded storage.
 bool spyre_is_sharded(const at::Tensor& tensor);
 
+#ifdef TORCH_SPYRE_FLEX
 // Device address of shard `shard_index` of a sharded tensor: the start of
 // that shard's own allocation. Resolved per launch for
 // non-unified kernels; never baked into compiled artifacts. Fails unless the
 // tensor has the shard count and per-shard bytes the kernel was compiled for.
+// Sharded path only: device_address is not in the spyre_rt bridge.
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes);
+#endif  // TORCH_SPYRE_FLEX
 
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, bool host2device)

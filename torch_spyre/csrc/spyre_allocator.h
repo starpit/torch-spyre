@@ -154,10 +154,13 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   void copy_data(void* dest, const void* src, std::size_t count) const final;
 
+#ifdef TORCH_SPYRE_FLEX
   // The vendor's compositeAddressToDeviceAddress: the device-addressable
-  // (segment) address of a view. Sharded path only.
+  // (segment) address of a view. Sharded path only; device_address is not
+  // in the spyre_rt bridge, so the whole translation stays under the ifdef.
   uint64_t compositeAddressToDeviceAddress(
       const spyre_rt::DeviceView& view) const;
+#endif  // TORCH_SPYRE_FLEX
 };
 
 }  // namespace spyre

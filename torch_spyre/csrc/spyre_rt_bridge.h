@@ -15,15 +15,14 @@
  */
 
 // The C++ side of the spyre_rt cxx bridge (docs/torch-spyre/API.md).
-// The Rust bridge includes this header to see the deeptools types it passes
-// through untouched, the csrc-owned HostKeepAlive, and the memory-pressure
-// callback. Nothing in here may depend on flex.
-//
 // The bridge API itself (every type and call below the Runtime) comes from
 // the cxx-GENERATED header of the spyre-torch crate — the same header the
 // link probe linked (/work/phase0/linkprobe) — resolved from the crate's
-// build output via setup.py's include dirs. It does not compile until
-// spyre-torch is built; that is the contract, not an accident.
+// build output via setup.py's include dirs. The deeptools includes below are
+// the types the bridge passes through untouched (data_conversion_info, Hcm);
+// the keep-alive BASE class and the memory-pressure callback are declared by
+// the crate's own include/spyre_torch.h, which the generated header pulls
+// in. Nothing in here may depend on flex.
 
 #pragma once
 
@@ -38,23 +37,21 @@
 
 namespace spyre {
 
-// Holds a c10::Storage alive across an asynchronous copy whose host pages
-// the Rust runtime touches after the call returns (a DCI-less H2D source, or
-// a D2H destination). Defined here, in the csrc, because c10::Storage is a
-// torch type the Rust side must not own. c10::Storage is itself an
-// intrusive-ptr handle, so holding it by value is one refcount.
-class HostKeepAlive {
+// The csrc's keep-alive for a copy whose host pages the Rust runtime
+// touches after the call returns (a raw H2D source, or a D2H destination):
+// spyre_rt::HostKeepAlive (the crate's base class) holding a c10::Storage.
+// Defined here, in the csrc, because c10::Storage is a torch type the Rust
+// side must not own; it is an intrusive-ptr handle, so holding it by value
+// is one refcount. The runtime destroys it when the transfer completes or
+// fails — possibly on the runtime's completion thread — so nothing here may
+// touch the GIL or torch's allocator lock.
+class StorageKeepAlive : public spyre_rt::HostKeepAlive {
  public:
-  explicit HostKeepAlive(c10::Storage storage)
+  explicit StorageKeepAlive(c10::Storage storage)
       : storage_(std::move(storage)) {}
 
  private:
   c10::Storage storage_;
 };
-
-// The vendor's FlexAllocator memory-pressure behaviour (flex_allocator.cpp
-// allocateInDomain): release, run Python GC, retry. Called by the Rust
-// allocator WITHOUT its lock held.
-void on_memory_pressure();
 
 }  // namespace spyre

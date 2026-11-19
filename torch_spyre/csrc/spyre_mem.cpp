@@ -1767,6 +1767,10 @@ bool spyre_is_sharded(const at::Tensor& tensor) {
   return ctx != nullptr && ctx->sharding.has_value();
 }
 
+// Sharded path only: its translation bottoms out in device_address, which
+// is not in the spyre_rt bridge, so the whole function stays under the
+// ifdef with the rest of the sharded surface.
+#ifdef TORCH_SPYRE_FLEX
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes) {
@@ -1795,6 +1799,7 @@ uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
   // launch) keeps the allocation alive.
   return SpyreAllocator::instance().compositeAddressToDeviceAddress(view);
 }
+#endif  // TORCH_SPYRE_FLEX
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
                               int64_t storage_offset, c10::IntArrayRef size,

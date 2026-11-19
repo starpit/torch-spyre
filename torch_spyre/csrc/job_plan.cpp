@@ -143,20 +143,28 @@ std::vector<spyre_rt::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArg
                 "symbolic_args tensor_id out of range");
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
-        resolved[i] = spyre_rt::HostComputeArg{
-            spyre_rt::HostComputeArgKind::Address,
-            *get_composite_address(tensors[arg.tensor_id]), /*value=*/0};
+        resolved[i] =
+            spyre_rt::host_compute_address(*get_composite_address(tensors[arg.tensor_id]));
         break;
+#ifdef TORCH_SPYRE_FLEX
       case SymbolicArgKind::kShardAddress:
         // dim_index = core (= shard), value = expected per-shard bytes,
         // num_shards = expected shard count; all checked against the tensor.
-        resolved[i] = spyre_rt::HostComputeArg{
-            spyre_rt::HostComputeArgKind::Value, spyre_rt::DeviceView{},
+        resolved[i] = spyre_rt::host_compute_value(
             static_cast<int64_t>(shard_device_address(tensors[arg.tensor_id],
                                                       arg.dim_index,
                                                       arg.num_shards,
-                                                      arg.value))};
+                                                      arg.value)));
         break;
+#else
+      case SymbolicArgKind::kShardAddress:
+        // Sharded host-compute args bottom out in device_address, which is
+        // not in the spyre_rt bridge (sharded path only).
+        TORCH_CHECK(false, "SymbolicArgKind::kShardAddress (sharded "
+                           "host-compute args) is not ported to the spyre_rt "
+                           "bridge");
+        break;
+#endif  // TORCH_SPYRE_FLEX
       case SymbolicArgKind::kDimension: {
         // A varying dimension behind a symbolic loop bound. The bundle
         // declares it as
@@ -193,8 +201,7 @@ std::vector<spyre_rt::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArg
                       "of the granularity ",
                       arg.granularity, " up to the maximum ", arg.max_value);
         }
-        resolved[i] = spyre_rt::HostComputeArg{
-            spyre_rt::HostComputeArgKind::Value, spyre_rt::DeviceView{}, size};
+        resolved[i] = spyre_rt::host_compute_value(size);
         break;
       }
       default:
@@ -219,9 +226,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {
-        args.push_back(spyre_rt::HostComputeArg{
-            spyre_rt::HostComputeArgKind::Address,
-            *get_composite_address(tensor), /*value=*/0});
+        args.push_back(
+            spyre_rt::host_compute_address(*get_composite_address(tensor)));
       }
     }
   }
