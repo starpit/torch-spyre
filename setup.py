@@ -43,6 +43,52 @@ DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
 PROFILER_SRC_DIR = CSRC_DIR / "profiler"
 
 
+# The senlib-rs checkout whose spyre-torch crate this build links (the
+# staticlib with the cxx bridge's Rust half, and everything below it). The
+# crate MUST be built first (`cargo build --release -p spyre-torch
+# --features snt1p0`, OCO route, CPATH=$DEEPTOOLS_INSTALL_DIR/include):
+# cxx-build writes the GENERATED bridge header and the version-matched
+# rust/cxx.h into its out dir, and the build-hash directory name changes
+# across clean builds, so it is discovered, never hardcoded.
+SENLIB_RS_DIR = Path(os.environ["SENLIB_RS_DIR"])
+SENLIB_RS_TARGET = SENLIB_RS_DIR / "target" / "release"
+
+
+def find_cxxbridge_include():
+    """The one cxxbridge out dir holding bridge.rs.h and rust/cxx.h.
+
+    Globs the crate's build dirs for the generated header and fails loudly
+    when spyre-torch has not been built (or was cleaned): the csrc includes
+    `spyre-torch/src/bridge.rs.h` through it.
+    """
+    candidates = sorted(
+        (SENLIB_RS_TARGET / "build").glob(
+            "spyre-torch-*/out/cxxbridge/include/spyre-torch/src/bridge.rs.h"
+        )
+    )
+    if not candidates:
+        raise RuntimeError(
+            "spyre-torch has not been built under "
+            f"{SENLIB_RS_TARGET}: no cxxbridge include dir with "
+            "spyre-torch/src/bridge.rs.h. Build it first: "
+            "cargo build --release -p spyre-torch --features snt1p0 "
+            "(OCO route, CPATH=$DEEPTOOLS_INSTALL_DIR/include)."
+        )
+    if len(candidates) > 1:
+        # More than one build dir holds a bridge header (a stale one from a
+        # source change, or several feature variants): pick nothing on a
+        # guess — name them and stop.
+        raise RuntimeError(
+            "multiple spyre-torch cxxbridge include dirs found: "
+            + ", ".join(str(c) for c in candidates)
+            + " — clean the stale ones and rebuild."
+        )
+    # candidates[0] is .../cxxbridge/include/spyre-torch/src/bridge.rs.h;
+    # the include dir to compile against is .../cxxbridge/include, which
+    # also holds the version-matched rust/cxx.h.
+    return candidates[0].parents[2]
+
+
 # Automatically download json.hpp if not present
 def maybe_download_nlohmann_json():
     """return path to header files"""
@@ -65,16 +111,23 @@ def maybe_download_nlohmann_json():
 
 INCLUDE_DIRS = [
     CSRC_DIR,
-    # Vendored cxx header (rust/cxx.h), version-matched to the spyre-torch
-    # crate's cxx pin (=1.0.205): the cxx bridge types (rust::Box,
-    # rust::Slice, rust::Error) the csrc consumes. Stub-phase only: once
-    # spyre-torch phase 2 lands, the csrc includes cxx.h and the GENERATED
-    # bridge header from the crate's build output instead, and this copy and
-    # the hand-written spyre_rt.h mirror go away.
-    CSRC_DIR / "external" / "cxx" / "include",
+    # The crate's cxx-build output: the GENERATED bridge header
+    # (spyre-torch/src/bridge.rs.h — the API the whole csrc calls) and the
+    # version-matched rust/cxx.h (the crate pins cxx =1.0.205). Discovered
+    # from the build output; nothing is vendored.
+    find_cxxbridge_include(),
+    # The generated header does #include "spyre-torch/include/spyre_torch.h"
+    # (the crate's consumer-contract header, which names the deeptools types
+    # the bridge passes through and the memory-pressure callback), rooted at
+    # the crates dir of the senlib-rs checkout.
+    SENLIB_RS_DIR / "crates",
     # "tracy/public"
 ]
-LIBRARY_DIRS = []
+LIBRARY_DIRS = [
+    # The spyre-torch staticlib (the cxx bridge's Rust half, with everything
+    # below it: flex-rs, senlib-rs, the export-controlled values).
+    SENLIB_RS_TARGET,
+]
 
 
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
@@ -147,11 +200,14 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-# The spyre_rt PoC build links no flex: the csrc talks to the Rust runtime
-# through the cxx bridge (spyre_rt.h; the stub spyre_rt_stub.cpp until the
-# crate lands) and to deeptools directly for the pieces the csrc itself uses
-# (sendefs, sen_data_convert, spyrecode-host-functions).
-LIBRARIES = ["spyrecode-host-functions", "util"]
+# The spyre_rt build links no flex: the csrc talks to the Rust runtime
+# through the spyre-torch crate's cxx bridge (libspyre_torch.a, the
+# staticlib) and to deeptools directly for the pieces the csrc itself uses
+# (sendefs, sen_data_convert, spyrecode-host-functions). Link order in the
+# extension link line: -lspyre_torch comes after these; the staticlib
+# leaves spyre_rt::on_memory_pressure undefined by design — the csrc
+# defines it, and the link fails by name if it does not.
+LIBRARIES = ["spyrecode-host-functions", "util", "spyre_torch"]
 
 
 if COMPILE_AIUPTI:  # Include kineto and libaiupti headers

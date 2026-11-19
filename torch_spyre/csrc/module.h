@@ -23,7 +23,7 @@
 #include <memory>
 #include <optional>
 
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 
 using DataConversionStrideInfo = data_conversion_stride_info;
 using DataConversionInfo = data_conversion_info;

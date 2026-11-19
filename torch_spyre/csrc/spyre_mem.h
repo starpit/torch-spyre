@@ -23,7 +23,7 @@
 #include <optional>
 
 #include "module.h"
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 #include "spyre_tensor_impl.h"
 
 #ifdef TORCH_SPYRE_FLEX

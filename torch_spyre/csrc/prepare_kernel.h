@@ -26,7 +26,7 @@
 #include <vector>
 
 #include "job_plan.h"
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 #include "spyre_stream.h"
 
 namespace spyre {

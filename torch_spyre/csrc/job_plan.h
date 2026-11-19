@@ -29,7 +29,7 @@
 #include <vector>
 
 #include "spyrecode-host-functions/spyrecode.h"
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 
 namespace spyre {
 

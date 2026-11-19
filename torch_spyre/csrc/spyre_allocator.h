@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 
 namespace spyre {
 

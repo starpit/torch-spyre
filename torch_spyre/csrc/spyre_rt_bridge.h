@@ -18,8 +18,16 @@
 // The Rust bridge includes this header to see the deeptools types it passes
 // through untouched, the csrc-owned HostKeepAlive, and the memory-pressure
 // callback. Nothing in here may depend on flex.
+//
+// The bridge API itself (every type and call below the Runtime) comes from
+// the cxx-GENERATED header of the spyre-torch crate — the same header the
+// link probe linked (/work/phase0/linkprobe) — resolved from the crate's
+// build output via setup.py's include dirs. It does not compile until
+// spyre-torch is built; that is the contract, not an accident.
 
 #pragma once
+
+#include "spyre-torch/src/bridge.rs.h"
 
 #include <spyrecode-host-functions/sendataconvert/sen_host_ops.h>
 #include <spyrecode-host-functions/spyrecode.h>

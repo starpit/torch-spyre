@@ -16,7 +16,7 @@
 
 #include "spyre_device_enum.h"
 
-#include "spyre_rt.h"
+#include "spyre_rt_bridge.h"
 
 namespace spyre {
 
