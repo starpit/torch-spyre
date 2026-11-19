@@ -20,7 +20,6 @@
 #include <torch/types.h>
 
 #include <cstdint>
-#include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -30,6 +29,7 @@
 #include <vector>
 
 #include "spyrecode-host-functions/spyrecode.h"
+#include "spyre_rt.h"
 
 namespace spyre {
 
@@ -307,7 +307,17 @@ struct LaunchContext {
    */
   std::vector<SymbolicArg> symbolic_args;
   bool batch_program_corrections = false;
+#ifdef TORCH_SPYRE_FLEX
+  // VF-only compound correction submission: PF's maxProgramCorrections() is 0
+  // (the vendor base default, runtime_scheduler.hpp:141), so the PoC build
+  // never batches and this vector stays empty.
   std::vector<flex::ProgramCorrection> program_corrections;
+#endif
+  // Reusable per-launch buffers, so a launch allocates nothing: the device
+  // views bound to a compute step, and the host-compute argument vector.
+  // Cleared and refilled by the steps that use them, in plan order.
+  std::vector<spyre_rt::DeviceView> tensor_views;
+  std::vector<spyre_rt::HostComputeArg> host_compute_args;
 };
 
 /**
@@ -428,9 +438,9 @@ class JobPlanStepH2D final : public JobPlanStep {
    * @param host_address Host memory address (lifetime managed by JobPlan)
    * @param device_address Device memory address
    */
-  JobPlanStepH2D(void* host_address, flex::CompositeAddress device_address)
+  JobPlanStepH2D(void* host_address, spyre_rt::DeviceView device_address)
       : host_address_(host_address),
-        device_address_(std::move(device_address)) {
+        device_address_(device_address) {
     role_ = StreamRole::Prep;  // H2D runs on the prep stream (S_prep)
   }
 
@@ -440,7 +450,7 @@ class JobPlanStepH2D final : public JobPlanStep {
 
  private:
   void* host_address_;  // Non-owning pointer (JobPlan owns the buffer)
-  flex::CompositeAddress device_address_;
+  spyre_rt::DeviceView device_address_;
 };
 
 /**
@@ -466,9 +476,9 @@ class JobPlanStepD2H final : public JobPlanStep {
    * @param host_address Host memory address (caller manages lifetime)
    * @param size Size of data to transfer
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address,
+  JobPlanStepD2H(spyre_rt::DeviceView device_address, void* host_address,
                  size_t size)
-      : device_address_(std::move(device_address)),
+      : device_address_(device_address),
         host_address_(host_address),
         size_(size) {}
 
@@ -487,7 +497,7 @@ class JobPlanStepD2H final : public JobPlanStep {
   void write(std::ostream& os) const override;
 
  private:
-  std::variant<flex::CompositeAddress, Dmva> device_address_;
+  std::variant<spyre_rt::DeviceView, Dmva> device_address_;
   void* host_address_;
   size_t size_;
 };
@@ -516,11 +526,11 @@ class JobPlanStepCompute final : public JobPlanStep {
    * (PendingRequest::node_name, aiupti activity name, FLEX JSON CBName).
    * Empty string ("") preserves the old behavior (no name).
    */
-  explicit JobPlanStepCompute(flex::CompositeAddress program_address,
+  explicit JobPlanStepCompute(spyre_rt::DeviceView program_address,
                               bool bind_io_addresses,
                               uint64_t bootstrap_offset = 0,
                               std::string name = "")
-      : program_address_(std::move(program_address)),
+      : program_address_(program_address),
         bind_io_addresses_(bind_io_addresses),
         bootstrap_offset_(bootstrap_offset),
         name_(std::move(name)) {}
@@ -534,7 +544,7 @@ class JobPlanStepCompute final : public JobPlanStep {
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress program_address_;
+  spyre_rt::DeviceView program_address_;
   bool bind_io_addresses_;
   uint64_t bootstrap_offset_;
   std::string name_;
@@ -560,29 +570,30 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    * @param hcm Compiler-provided metadata from deeptools (contains vdci and
    *            senConstants describing how symbolic values must be interpreted)
    * @param correction_size Size of the correction blob in bytes (must equal
-   *            device_address.total_size())
-   * @param device_address Device CompositeAddress that receives the correction
+   *            device_address.size)
+   * @param device_address Device view that receives the correction
    *            blob via H2D after produce().
    * @param input_buffer Pinned host buffer used as input (Case 1); nullptr for
    *            Cases 2 and 3.
    * @param ishape used to discriminate case 2 (fake symbols)
    */
   JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, size_t correction_size,
-                         flex::CompositeAddress device_address,
+                         spyre_rt::DeviceView device_address,
                          const void* input_buffer, std::vector<int64_t> ishape)
       : correction_size_(correction_size),
-        device_address_(std::move(device_address)),
+        device_address_(device_address),
         input_buffer_(input_buffer),
-        ishape_(std::move(ishape)) {
+        ishape_(std::move(ishape)),
+        // Create the host compute handle at construction time.
+        // This will internally create the fast_plan for deeptools. (In the
+        // member-init list: rust::Box is move-constructible but not
+        // assignable.)
+        handle_(spyre_rt::create_host_compute_handle(std::move(hcm))) {
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
     // its barrier.
     role_ = StreamRole::Prep;
-
-    // Create the host compute handle at construction time.
-    // This will internally create the fast_plan for deeptools.
-    handle_ = flex::createHostComputeHandle(std::move(hcm));
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
@@ -599,16 +610,16 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    * returned vector therefore carries two kinds of value, so anything that
    * reads it has to handle both alternatives.
    */
-  static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
+  static std::vector<spyre_rt::HostComputeArg> resolveSymbolicArgs(
       const std::vector<at::Tensor>& tensors,
       const std::vector<SymbolicArg>& symbolic_args);
 
  private:
   size_t correction_size_;  ///< byte count of the correction blob
-  flex::CompositeAddress device_address_;  ///< device destination for H2D
+  spyre_rt::DeviceView device_address_;  ///< device destination for H2D
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
-  std::unique_ptr<flex::HostComputeHandle>
+  rust::Box<spyre_rt::HostComputeHandle>
       handle_;  ///< handle to the host compute operation
 };
 
@@ -651,19 +662,26 @@ struct JobPlan {
   std::vector<std::unique_ptr<JobPlanStep>> steps;
 
   /**
-   * @brief vector of CompositeAddress with the first being the owning
-   * CompositeAddress of the program binary, and conditionally program
-   * correction data and spillover tensor data, and the rest being the
-   * non-owning CompositeAddress of each program.
+   * @brief Owning device allocation for the program binary, and
+   * conditionally program correction data and spillover tensor data.
    *
-   * The JobPlan owns this address and is responsible for its lifetime. When the
-   * JobPlan is destroyed, the memory is freed.
+   * The JobPlan owns this allocation and is responsible for its lifetime.
+   * When the JobPlan is destroyed, the memory is freed.
    *
-   * Set during PrepareKernel when it's loaded to device memory. Empty for pure
-   * DMA JobPlans (e.g., tensor .to(device)) that don't involve compute
+   * Set during PrepareKernel when it's loaded to device memory. Empty for
+   * pure DMA JobPlans (e.g., tensor .to(device)) that don't involve compute
    * operations.
    */
-  std::vector<flex::CompositeAddress> job_allocation;
+  std::vector<rust::Box<spyre_rt::Allocation>> job_allocation;
+
+  /**
+   * @brief Non-owning views of each program inside job_allocation's
+   * allocation (the vendor's job_allocation[1..] entries).
+   *
+   * Debug/print surface only: the steps hold their own views, and the
+   * allocation stays alive through job_allocation.
+   */
+  std::vector<spyre_rt::DeviceView> program_views;
 
   /**
    * @brief Compiled tile dimensions from SpyreCode

@@ -19,12 +19,16 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
-#include <flex/flex.hpp>
 #include <map>
 #include <optional>
 
 #include "module.h"
+#include "spyre_rt.h"
 #include "spyre_tensor_impl.h"
+
+#ifdef TORCH_SPYRE_FLEX
+#include <flex/flex.hpp>
+#endif
 
 namespace spyre {
 
@@ -37,12 +41,15 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
+#ifdef TORCH_SPYRE_FLEX
+// KV-cache offload is not on the chat path and is not ported to spyre_rt.
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
                       const flex::SharedPool& pool, size_t slot_id,
                       bool to_device);
+#endif
 
 /**
- * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely
+ * Uses the runtime's device-side fill to perform the fill entirely
  * on-device without allocating a host buffer or performing an H2D DMA.
  *
  * @param self The spyre tensor to fill (in-place)

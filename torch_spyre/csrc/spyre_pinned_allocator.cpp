@@ -17,7 +17,6 @@
 #include "spyre_pinned_allocator.h"
 
 #include <cstring>
-#include <flex/flex.hpp>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -25,6 +24,10 @@
 #include <vector>
 
 #include "module.h"
+
+#ifdef TORCH_SPYRE_FLEX
+
+#include <flex/flex.hpp>
 
 namespace spyre {
 
@@ -214,3 +217,5 @@ at::HostAllocator* GetSpyrePinnedAllocator() {
 }
 
 }  // namespace spyre
+
+#endif  // TORCH_SPYRE_FLEX

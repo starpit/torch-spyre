@@ -28,35 +28,12 @@
 
 namespace spyre {
 
-SpyreAllocator::SpyreAllocator() {
-  // Callback registration is deferred until first allocation
-  // to avoid accessing RuntimeContext during static initialization
-}
+SpyreAllocator::SpyreAllocator() = default;
 
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 std::mutex SpyreAllocator::stats_mutex_;
-
-std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
-  // FlexAllocator is owned by RuntimeContext (one per device per process).
-  // RuntimeContext::getAllocator() returns shared_ptr<FlexAllocator>;
-  auto flex_alloc = flex::RuntimeContext::getInstance()->getAllocator();
-
-  // Register memory pressure callback on first access (lazy initialization)
-  static std::once_flag callback_registered;
-  std::call_once(callback_registered, [&flex_alloc]() {
-    if (flex_alloc) {
-      flex_alloc->registerMemoryPressureCallback(
-          &SpyreAllocator::memoryPressureCallback);
-      SPYRE_RUNTIME_DEBUG()
-          << "(getFlexAllocator) registered memory pressure callback with "
-             "FlexAllocator";
-    }
-  });
-
-  return flex_alloc;
-}
 
 SpyreAllocator& SpyreAllocator::instance() {
   static SpyreAllocator allocator;
@@ -80,15 +57,16 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
 
 std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
     c10::DeviceIndex device) {
-  int64_t active_device_id =
-      flex::RuntimeContext::getInstance()->getDeviceIndex();
-  TORCH_CHECK(static_cast<int64_t>(device) == active_device_id,
-              "SpyreAllocator::getMemoryInfo: requested device index ", device,
-              " does not match the active device (", active_device_id, ")");
-  auto flex_alloc = getFlexAllocator();
-  flex::MemoryStats mem_stats =
-      flex_alloc->getMemoryStats(flex::MemoryType::Tensor);
-  return {mem_stats.free_bytes, mem_stats.total_bytes};
+  auto* runtime = GlobalRuntime::get();
+  TORCH_CHECK(runtime != nullptr,
+              "SpyreAllocator::getMemoryInfo: the spyre_rt runtime is not "
+              "initialized");
+  // The vendor checks the requested index against the runtime's active
+  // device; spyre_rt owns one device per process, so the index must be 0
+  // (or -1 resolved to it) exactly as before.
+  spyre_rt::MemoryStats mem_stats =
+      runtime->memory_stats(spyre_rt::MemoryType::Tensor);
+  return {mem_stats.free.raw, mem_stats.total.raw};
 }
 
 void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
@@ -112,12 +90,12 @@ void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
 }
 
 void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id,
-                                 flex::MemoryType memory_type) {
+                                 spyre_rt::MemoryType memory_type) {
   // User-visible accounting (stats and profiler) is Tensor-only.
   // Program and other non-Tensor allocations must not appear in user-visible
-  // memory stats: on release the CompositeAddress has already been moved out,
-  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
-  if (memory_type != flex::MemoryType::Tensor) {
+  // memory stats: on release the ctx is already gone, so nbytes would be 0
+  // and would leave an unmatched +N in the profiler.
+  if (memory_type != spyre_rt::MemoryType::Tensor) {
     return;
   }
   int64_t total_allocated;
@@ -149,12 +127,9 @@ void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id,
 }
 
 void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id,
-                                   flex::MemoryType memory_type) {
+                                   spyre_rt::MemoryType memory_type) {
   // User-visible accounting (stats and profiler) is Tensor-only.
-  // Program and other non-Tensor allocations must not appear in user-visible
-  // memory stats: on release the CompositeAddress has already been moved out,
-  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
-  if (memory_type != flex::MemoryType::Tensor) {
+  if (memory_type != spyre_rt::MemoryType::Tensor) {
     return;
   }
   int64_t total_allocated;
@@ -186,13 +161,15 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id,
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
-  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt, flex::MemoryType::Tensor);
-  return SpyreAllocator::allocate(nbytes, directive);
+  // The vendor's default directive: PlacementPolicy::Bind, domain {0},
+  // MemoryType::Tensor.
+  return SpyreAllocator::allocate(nbytes, spyre_rt::MemoryType::Tensor,
+                                  {spyre_rt::DomainId{0}});
 }
 
 c10::DataPtr SpyreAllocator::allocate(
-    size_t nbytes, const flex::AllocationDirective& directive) {
+    size_t nbytes, spyre_rt::MemoryType memory_type,
+    const std::vector<spyre_rt::DomainId>& domains) {
   c10::Device curr_device =
       c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
 
@@ -203,86 +180,34 @@ c10::DataPtr SpyreAllocator::allocate(
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
-  // Get shared_ptr to keep FlexAllocator alive during operations
-  auto flex_alloc = getFlexAllocator();
+  auto* runtime = GlobalRuntime::get();
+  TORCH_CHECK(runtime != nullptr,
+              "SpyreAllocator::allocate: the spyre_rt runtime is not "
+              "initialized (was start_runtime called?)");
 
-  // Allocate first-class raw storage via CompositeAddress.
-  flex::CompositeAddress composite_addr =
-      flex_alloc->allocate(nbytes, directive);
+  rust::Box<spyre_rt::Allocation> allocation = runtime->allocate(
+      spyre_rt::ByteSize{nbytes}, memory_type,
+      rust::Slice<const spyre_rt::DomainId>(domains.data(), domains.size()));
 
-  SPYRE_RUNTIME_DEBUG() << "allocated " << composite_addr;
-  // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
-  // allocation may be larger than the requested nbytes. Use total_size() for
-  // accurate memory profiling.
-  size_t actual_nbytes = composite_addr.total_size();
-
-  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id,
-                                 directive.memory_type);
+  auto* ctx = new SharedOwnerCtx(std::move(allocation), device_id,
+                                 memory_type);
   void* ctx_void = static_cast<void*>(ctx);
 
   // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
   // This pointer is never dereferenced — it serves only as a unique token for
   // memory profiling (recordAlloc/recordRelease).
   void* data_void = static_cast<void*>(ctx);
-  recordAlloc(actual_nbytes, data_void, device_id, directive.memory_type);
+  // The runtime rounds up to the device alignment (the vendor's
+  // DEVICE_ALIGNMENT, 128 bytes), so the actual allocation may be larger
+  // than the requested nbytes. Use the cached view's size for accurate
+  // memory profiling.
+  recordAlloc(ctx->view.size.raw, data_void, device_id, memory_type);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
 
   return data_ptr_result;
 }
-
-namespace {
-
-// Backing for sharded storage on plain Flex (no allocator-side sharding API):
-// one ordinary allocation per shard, indexed by shard ordinal. The shard table
-// is torch-spyre-owned — shard i backs core i — and each shard names its Flex
-// memory domain explicitly: shard i is bound to domain i % num_domains from
-// the topology. On single-domain backends that is domain 0 for every shard
-// (the domain first-fit chose, now by statement); under multi-domain
-// emulation it spreads the shards so the per-domain region bookkeeping,
-// multi-chunk scheduler, and DMA paths are exercised. The domain is an
-// allocation-time fact only — it enters no guard, cache key, or kernel, and
-// the region/segment/offset placement within the domain remains the Flex
-// allocator's choice. Device sizes are stick-multiples, so each shard's chunk
-// is exactly shard_device_bytes.
-std::vector<flex::CompositeAddress> allocateShardTable(
-    const std::shared_ptr<flex::FlexAllocator>& flex_alloc,
-    uint64_t shard_device_bytes, uint32_t logical_chunks) {
-  const uint32_t num_domains =
-      static_cast<uint32_t>(flex_alloc->topology().numDomains());
-  std::vector<flex::CompositeAddress> shards;
-  shards.reserve(logical_chunks);
-  for (uint32_t i = 0; i < logical_chunks; ++i) {
-    flex::AllocationDirective directive(flex::PlacementPolicy::Bind,
-                                        {i % num_domains}, std::nullopt,
-                                        flex::MemoryType::Tensor);
-    flex::CompositeAddress shard = flex_alloc->allocate(
-        static_cast<size_t>(shard_device_bytes), directive);
-    TORCH_CHECK(shard.num_chunks() == 1, "plain per-shard allocation ", i,
-                " is not single-chunk");
-    TORCH_CHECK(shard.chunks()[0].size == shard_device_bytes,
-                "plain per-shard allocation ", i, " covers ",
-                shard.chunks()[0].size, " bytes, expected ",
-                shard_device_bytes);
-    shards.push_back(std::move(shard));
-  }
-  return shards;
-}
-
-// Non-owning whole-storage view over the shard table's chunks, in shard order.
-// Hand-built, so its destructor never frees; the shard table owns the memory.
-flex::CompositeAddress wholeStorageView(
-    const std::vector<flex::CompositeAddress>& shards) {
-  std::vector<flex::Chunk> chunks;
-  chunks.reserve(shards.size());
-  for (const auto& shard : shards) {
-    chunks.push_back(shard.chunks()[0]);
-  }
-  return flex::CompositeAddress(chunks);
-}
-
-}  // namespace
 
 c10::DataPtr SpyreAllocator::allocateShardedStorage(
     int64_t shard_dim, uint32_t logical_chunks, uint64_t shard_device_bytes) {
@@ -299,26 +224,46 @@ c10::DataPtr SpyreAllocator::allocateShardedStorage(
 
   c10::Device curr_device =
       c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
-  auto flex_alloc = getFlexAllocator();
-  TORCH_CHECK(flex_alloc != nullptr, "Flex allocator is not available");
+  auto* runtime = GlobalRuntime::get();
+  TORCH_CHECK(runtime != nullptr,
+              "SpyreAllocator::allocateShardedStorage: the spyre_rt runtime "
+              "is not initialized");
+
+  const uint32_t num_domains = runtime->num_domains();
 
   // Each shard is its own aligned plain allocation; shard i backs core i by
-  // the torch-spyre-owned shard table (Flex places it within the named
-  // domain — see allocateShardTable).
-  std::vector<flex::CompositeAddress> shards =
-      allocateShardTable(flex_alloc, shard_device_bytes, logical_chunks);
+  // the torch-spyre-owned shard table, bound to Flex memory domain
+  // i % num_domains from the topology (the vendor's allocateShardTable).
+  std::vector<rust::Box<spyre_rt::Allocation>> shard_allocations;
+  std::vector<spyre_rt::DeviceView> shard_views;
+  shard_allocations.reserve(logical_chunks);
+  shard_views.reserve(logical_chunks);
+  for (uint32_t i = 0; i < logical_chunks; ++i) {
+    std::vector<spyre_rt::DomainId> domains{
+        spyre_rt::DomainId{i % num_domains}};
+    shard_allocations.push_back(runtime->allocate(
+        spyre_rt::ByteSize{shard_device_bytes},
+        spyre_rt::MemoryType::Tensor,
+        rust::Slice<const spyre_rt::DomainId>(domains.data(), domains.size())));
+    shard_views.push_back(shard_allocations.back()->view());
+    TORCH_CHECK(shard_views.back().size.raw == shard_device_bytes,
+                "plain per-shard allocation ", i, " covers ",
+                shard_views.back().size.raw, " bytes, expected ",
+                shard_device_bytes);
+  }
 
   const size_t actual_nbytes =
       static_cast<size_t>(shard_device_bytes) * logical_chunks;
   auto device_id = curr_device.index();
-  auto* ctx = new SharedOwnerCtx(wholeStorageView(shards), device_id,
-                                 flex::MemoryType::Tensor);
-  ctx->shard_addrs = std::move(shards);
+  auto* ctx = new SharedOwnerCtx(
+      spyre_rt::DeviceView{}, device_id, spyre_rt::MemoryType::Tensor);
+  ctx->shard_allocations = std::move(shard_allocations);
+  ctx->shard_views = std::move(shard_views);
   ctx->sharding =
       ShardedStorageInfo{shard_dim, logical_chunks, shard_device_bytes};
   void* ctx_void = static_cast<void*>(ctx);
   SpyreAllocator::instance().recordAlloc(actual_nbytes, ctx_void, device_id,
-                                         flex::MemoryType::Tensor);
+                                         spyre_rt::MemoryType::Tensor);
   return c10::DataPtr(ctx_void, ctx_void, &ReportAndDelete, curr_device);
 }
 
@@ -327,15 +272,15 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
     return;
   }
   auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-  size_t nbytes = ctx->composite_addr.total_size();
+  size_t nbytes = ctx->total_size();
 
   SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
                                            ctx->device_id, ctx->memory_type);
-  delete ctx;
+  delete ctx;  // drops the Box(es); the runtime frees the device blocks
 }
 
-// The raw deleter only gets passed the data ptr, no context, so
-// it would not work right now. To implement this, we first need to
+// The raw deleter only gets passed the data ptr, no context, so it
+// would not work right now. To implement this, we first need to
 // create a runtime interface that can correctly free an allocation
 // only based on the data ptr, without the allocation idx from the
 // context
@@ -348,65 +293,33 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   py::gil_scoped_acquire acquire;
   SPYRE_RUNTIME_DEBUG() << "called";
   // do nothing -- look into when this is called
-  // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
-  // reinterpret_cast<spyre_ptr_t>(src));
 }
 
 uint64_t SpyreAllocator::compositeAddressToDeviceAddress(
-    const flex::CompositeAddress& addr) const {
-  return flex::compositeAddressToDeviceAddress(
-      addr, getFlexAllocator()->getIdToRegionMap());
+    const spyre_rt::DeviceView& view) const {
+  auto* runtime = GlobalRuntime::get();
+  TORCH_CHECK(runtime != nullptr,
+              "compositeAddressToDeviceAddress: the spyre_rt runtime is not "
+              "initialized");
+  return runtime->device_address(view);
 }
 
-void SpyreAllocator::memoryPressureCallback(
-    std::unique_lock<std::mutex>& lock) {
-  // This callback is invoked by FlexAllocator while holding allocator_mutex
-  // (via a unique_lock). We must:
-  // 1. Release the allocator mutex
-  // 2. Acquire the Python GIL
-  // 3. Call PyGC_Collect()
-  // 4. Release the GIL
-  // 5. Re-acquire the allocator mutex
-  //
-  // Lock ordering: allocator_mutex -> (release) -> GIL -> (release) ->
-  // allocator_mutex. This prevents deadlock with Python threads that hold GIL
-  // before calling allocate().
-  //
-  // Exception safety: the caller holds a unique_lock whose destructor will
-  // handle the mutex correctly if this callback throws, so no catch-to-relock
-  // pattern is needed here.
-
-  SPYRE_RUNTIME_DEBUG() << "releasing allocator mutex";
-
-  // Step 1: Release allocator mutex
-  lock.unlock();
-
-  // Step 2: Acquire Python GIL
-  // PyGILState_Ensure() is safe to call from any thread, even if the thread
-  // was not created by Python. It returns the previous GIL state.
-  SPYRE_RUNTIME_DEBUG() << "acquiring Python GIL for garbage collection";
+// The vendor's FlexAllocator memory-pressure callback (flex_allocator.cpp
+// allocateInDomain): the Rust allocator calls this WITHOUT its lock held;
+// it releases nothing itself, runs the Python GC, and returns. Retry
+// semantics stay in the Rust allocator.
+void on_memory_pressure() {
+  SPYRE_RUNTIME_DEBUG() << "memory pressure: acquiring Python GIL for "
+                           "garbage collection";
   PyGILState_STATE gstate = PyGILState_Ensure();
-
-  // Step 3: Trigger Python garbage collection
-  // PyGC_Collect() runs a full collection cycle and returns the number of
-  // unreachable objects found (or -1 on error)
-  SPYRE_RUNTIME_DEBUG() << "calling PyGC_Collect()";
   Py_ssize_t collected = PyGC_Collect();
-
   if (collected >= 0) {
-    SPYRE_RUNTIME_DEBUG() << "PyGC_Collect() completed, collected " << collected
-                          << " objects";
+    SPYRE_RUNTIME_DEBUG() << "PyGC_Collect() completed, collected "
+                          << collected << " objects";
   } else {
     SPYRE_RUNTIME_DEBUG() << "PyGC_Collect() returned error";
   }
-
-  // Step 4: Release Python GIL
-  SPYRE_RUNTIME_DEBUG() << "releasing Python GIL";
   PyGILState_Release(gstate);
-
-  // Step 5: Re-acquire allocator mutex before returning to FlexAllocator
-  SPYRE_RUNTIME_DEBUG() << "re-acquiring allocator mutex";
-  lock.lock();
   SPYRE_RUNTIME_DEBUG() << "memory pressure callback complete";
 }
 

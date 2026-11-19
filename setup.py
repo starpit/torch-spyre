@@ -65,6 +65,9 @@ def maybe_download_nlohmann_json():
 
 INCLUDE_DIRS = [
     CSRC_DIR,
+    # Vendored cxx 1.0.145 header (rust/cxx.h): the cxx bridge types
+    # (rust::Box, rust::Slice, rust::Error) the csrc consumes.
+    CSRC_DIR / "external" / "cxx" / "include",
     # "tracy/public"
 ]
 LIBRARY_DIRS = []
@@ -100,6 +103,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
         DEEPTOOLS_DIR / "include",
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+    LIBRARY_DIRS += [DEEPTOOLS_DIR / "lib"]
 
 # The USE_SPYRE_CCL environment variable can be used to build torch-spyre
 # without support for Multi-Spyre. This is for developers only.
@@ -139,7 +143,11 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-LIBRARIES = ["flex"]
+# The spyre_rt PoC build links no flex: the csrc talks to the Rust runtime
+# through the cxx bridge (spyre_rt.h; the stub spyre_rt_stub.cpp until the
+# crate lands) and to deeptools directly for the pieces the csrc itself uses
+# (sendefs, sen_data_convert, spyrecode-host-functions).
+LIBRARIES = ["spyrecode-host-functions", "util"]
 
 
 if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
@@ -235,7 +243,10 @@ if __name__ == "__main__":
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
 
-        base_define_macros.append(("USE_FLEX_NAMESPACE", None))
+        # TORCH_SPYRE_FLEX is deliberately NEVER defined in the spyre_rt build:
+        # every flex-only surface (pools, pinned allocator, CopyRaw KV offload,
+        # batched VF corrections, region introspection) lives behind it and
+        # stays uncompiled.
 
         if COMPILE_AIUPTI:
             base_define_macros.append(("HAS_AIUPTI", None))

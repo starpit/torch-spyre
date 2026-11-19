@@ -88,34 +88,29 @@ static TransferDirection parse_transfer_direction(const std::string& dirn_str) {
 }
 
 /**
- * @brief Helper to compute CompositeAddress with offset from device_addr for
- * program
+ * @brief Helper to compute a program's DeviceView with offset from the job
+ * allocation for a program-segment device pointer
  */
-static flex::CompositeAddress compute_offset_address(
-    const flex::CompositeAddress& job_allocation, uint64_t dev_ptr,
+static spyre_rt::DeviceView compute_offset_address(
+    const spyre_rt::DeviceView& job_allocation, uint64_t dev_ptr,
     size_t size = 0) {
-  // Create CompositeAddress using program_address with offset
-  TORCH_CHECK(job_allocation.chunks().size() == 1,
-              "job_allocation must have 1 chunk");
-
-  const auto [segment_id, segment_offset, segment_type] =
-      flex::decodeDevicePointer(dev_ptr);
+  const spyre_rt::DecodedPointer decoded =
+      spyre_rt::decode_device_pointer(dev_ptr);
   // Validate device pointer is within program segment bounds
-  TORCH_CHECK(segment_type == flex::MemoryType::Program, "Device pointer 0x",
-              std::hex, dev_ptr, " has memory type ",
-              static_cast<int>(segment_type),
+  TORCH_CHECK(decoded.memory_type == spyre_rt::MemoryType::Program,
+              "Device pointer 0x", std::hex, dev_ptr, " has memory type ",
+              static_cast<int>(decoded.memory_type),
               " but must be in segment 7 (Program) for ComputeOnDevice");
+  const uint64_t segment_offset = decoded.offset.raw;
 
   if (size == 0) {
-    size = job_allocation.total_size() - segment_offset;
+    size = job_allocation.size.raw - segment_offset;
   }
 
-  // Get the first chunk and add offset to its address
-  const auto& base_chunk = job_allocation.chunks()[0];
-  flex::LogicalAddress offset_addr(base_chunk.addr.region_id,
-                                   base_chunk.addr.offset + segment_offset);
-  flex::Chunk offset_chunk(offset_addr, size, base_chunk.domain_id);
-  return flex::CompositeAddress(offset_chunk);
+  return spyre_rt::DeviceView{
+      job_allocation.region,
+      spyre_rt::ByteOffset{job_allocation.offset.raw + segment_offset},
+      spyre_rt::ByteSize{size}, job_allocation.domain};
 }
 
 /**
@@ -263,13 +258,14 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
   size_t size = safe_stoull(size_str, "Allocate size");
 
   auto& allocator = SpyreAllocator::instance();
-  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt, flex::MemoryType::Program);
-  c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
+  // The vendor's AllocationDirective(PlacementPolicy::Bind, {0}, nullopt,
+  // MemoryType::Program) reduced to its (memory type, domains) content.
+  c10::DataPtr allocated_ptr = allocator.allocate(
+      size, spyre_rt::MemoryType::Program, {spyre_rt::DomainId{0}});
 
   job_allocation_.emplace_back(
-      std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
-                    ->composite_addr));
+      std::move(*static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
+                     ->allocation));
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -304,12 +300,13 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string init_size_str = init_props["size"].get<std::string>();
   size_t init_size = safe_stoull(init_size_str, "InitTransfer size");
 
-  job_allocation_.emplace_back(
-      compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
+  program_views_.emplace_back(
+      compute_offset_address(job_allocation_.at(0)->view(), dev_ptr,
+                             init_size));
 
   stream_.copyProgramAsync(
       const_cast<void*>(static_cast<const void*>(inits_.back().data())),
-      &job_allocation_.back());
+      &program_views_.back());
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -365,31 +362,30 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
            std::to_string(step_idx);
   }
 
-  const auto [segment_id, segment_offset, segment_type] =
-      flex::decodeDevicePointer(job_bin_ptr);
+  const spyre_rt::DecodedPointer decoded =
+      spyre_rt::decode_device_pointer(job_bin_ptr);
 
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in
   // segment 7 and derive the offset of that entry point within the program
   // allocation (0 when the binary starts at the allocation base).
-  TORCH_CHECK(segment_type == flex::MemoryType::Program, "job_bin_ptr 0x",
-              std::hex, job_bin_ptr, " has memory type ",
-              static_cast<int>(segment_type), ", expected type ",
-              static_cast<int>(flex::MemoryType::Program),
+  TORCH_CHECK(decoded.memory_type == spyre_rt::MemoryType::Program,
+              "job_bin_ptr 0x", std::hex, job_bin_ptr, " has memory type ",
+              static_cast<int>(decoded.memory_type), ", expected type ",
+              static_cast<int>(spyre_rt::MemoryType::Program),
               " (Program segment)");
 
-  // Hand flex the program's FULL allocation as a non-owning descriptor over the
-  // same chunk (the owning CompositeAddress stays in job_allocation_, which is
-  // later moved into the JobPlan and outlives this step). flex bounds the
-  // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
-  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically
-  // if/when deeptools grows the Allocate, requiring no further change here.
-  TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
-              "job_allocation must have 1 chunk");
-  TORCH_CHECK(
-      job_allocation_.at(0).total_size() > 0,
-      "ComputeOnDevice program allocation must be populated (size > 0)");
-  flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
+  // Hand the runtime the program's FULL allocation as a non-owning view (the
+  // owning Allocation stays in job_allocation_, which is later moved into the
+  // JobPlan and outlives this step). The runtime bounds the segment-7 xlat to
+  // the allocation's size -- the real deeptools Allocate footprint -- instead
+  // of the 16GB SEGMENT_SIZE. The size grows automatically if/when deeptools
+  // grows the Allocate, requiring no further change here.
+  const spyre_rt::DeviceView program_address =
+      job_allocation_.at(0)->view();
+  TORCH_CHECK(program_address.size.raw > 0,
+              "ComputeOnDevice program allocation must be populated (size > "
+              "0)");
 
   // Remember the activity name base. build() registers the SDSC bundle
   // directory prefix under it once the whole plan is validated. Keying on the
@@ -397,9 +393,10 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // above whether or not provenance is present.
   activity_name_bases_.insert(spyre::activityNameBase(name));
 
-  return std::make_unique<JobPlanStepCompute>(std::move(program_address),
+  return std::make_unique<JobPlanStepCompute>(program_address,
                                               bind_io_addresses_,
-                                              segment_offset, std::move(name));
+                                              decoded.offset.raw,
+                                              std::move(name));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
@@ -510,8 +507,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
               ") does not match adjacent DataTransfer H2D size (",
               transfer_size, ") for ohandle '", ohandle, "'");
 
-  flex::CompositeAddress device_address =
-      compute_offset_address(job_allocation_.at(0), device_ptr, transfer_size);
+  spyre_rt::DeviceView device_address = compute_offset_address(
+      job_allocation_.at(0)->view(), device_ptr, transfer_size);
 
   return std::make_unique<JobPlanStepHostCompute>(
       std::move(hcm_data), correction_size, std::move(device_address), inp_ptr,
@@ -553,11 +550,11 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
           safe_stoull(dev_ptr_str, "DataTransfer H2D dev_ptr");
       size_t transfer_size = safe_stoull(size_str, "DataTransfer H2D size");
 
-      // Compute CompositeAddress with offset
-      flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.at(0), device_ptr, transfer_size);
+      // Compute the program's view with offset
+      spyre_rt::DeviceView comp_addr = compute_offset_address(
+          job_allocation_.at(0)->view(), device_ptr, transfer_size);
 
-      return std::make_unique<JobPlanStepH2D>(host_addr, std::move(comp_addr));
+      return std::make_unique<JobPlanStepH2D>(host_addr, comp_addr);
     }
 
     case TransferDirection::DeviceToHost: {
@@ -595,16 +592,16 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       }
       void* host_addr = pinned_buffer_map_[host_handle_str].data();
 
-      // If device_ptr is in segment 7, calculate CompositeAddress and store it
-      // in JobPlanStepH2D. If device_ptr is in tensor segments, store
+      // If device_ptr is in segment 7, calculate the program view and store it
+      // in JobPlanStepD2H. If device_ptr is in tensor segments, store
       // device_ptr
-      const auto segment_type =
-          std::get<2>(flex::decodeDevicePointer(device_ptr));
-      if (segment_type == flex::MemoryType::Program) {
-        // Compute CompositeAddress with offset from device_addr
-        flex::CompositeAddress comp_addr = compute_offset_address(
-            job_allocation_.at(0), device_ptr, transfer_size);
-        return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr,
+      const spyre_rt::DecodedPointer decoded =
+          spyre_rt::decode_device_pointer(device_ptr);
+      if (decoded.memory_type == spyre_rt::MemoryType::Program) {
+        // Compute the program's view with offset
+        spyre_rt::DeviceView comp_addr = compute_offset_address(
+            job_allocation_.at(0)->view(), device_ptr, transfer_size);
+        return std::make_unique<JobPlanStepD2H>(comp_addr, host_addr,
                                                 transfer_size);
       } else {
         TORCH_CHECK(bind_io_addresses_ == true,
@@ -725,6 +722,7 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   return std::make_unique<JobPlan>(
       JobPlan{std::move(steps),            // steps
               std::move(job_allocation_),  // job_allocation
+              std::move(program_views_),   // program_views
               {},                          // expected_input_shapes
               std::move(pinned_buffers),   // pinned_buffers
               std::move(inits_)});

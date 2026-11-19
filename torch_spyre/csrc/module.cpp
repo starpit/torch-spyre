@@ -28,7 +28,6 @@
 #include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
-#include <flex/flex.hpp>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -47,6 +46,10 @@
 #include <pybind11/chrono.h>
 
 #include "distributed/spyre_ccl.hpp"
+#endif
+
+#ifdef TORCH_SPYRE_FLEX
+#include <flex/flex.hpp>
 #endif
 
 #include "logging.h"
@@ -153,11 +156,12 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  // create() never returns null: it returns the singleton or throws.
-  flex::RuntimeContext* runtime =
-      flex::RuntimeContext::create(logical_device_id);
+  // create_runtime never returns null: it returns the runtime or throws.
+  rust::Box<spyre_rt::Runtime> runtime =
+      spyre_rt::create_runtime(spyre_rt::DeviceIndex{
+          static_cast<uint32_t>(logical_device_id)});
   init_from_env();
-  GlobalRuntime::set(runtime);
+  GlobalRuntime::set(std::move(runtime));
   // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
   // creation via track_hazards; nothing to toggle on the runtime here.
   SPYRE_RUNTIME_DEBUG() << "runtime started with logical_device_id "
@@ -237,12 +241,23 @@ PYBIND11_MODULE(_C, m) {
         return spyre::detail::createSpyreGenerator(device);
       }
       at::Allocator* getPinnedMemoryAllocator() const override {
+        // The chat path never pins; the pinned allocator is a flex-only
+        // debug/test surface (spyre_pinned_allocator.{h,cpp}).
+#ifdef TORCH_SPYRE_FLEX
         return spyre::GetSpyrePinnedAllocator();
+#else
+        return nullptr;
+#endif
       }
       bool isPinnedPtr(const void* data) const override {
+#ifdef TORCH_SPYRE_FLEX
         auto* allocator = static_cast<spyre::SpyrePinnedAllocator*>(
             spyre::GetSpyrePinnedAllocator());
         return allocator->isPinnedPtr(data);
+#else
+        (void)data;
+        return false;
+#endif
       }
     };
     static auto* hooks = new SpyreHooksInterface();
@@ -325,6 +340,8 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
+#ifdef TORCH_SPYRE_FLEX
+  // Host-dram pool API (KV-cache offload): flex-only, not ported to spyre_rt.
   py::enum_<flex::PoolBackend>(m, "PoolBackend")
       .value("HostDram", flex::PoolBackend::HostDram);
 
@@ -536,6 +553,7 @@ PYBIND11_MODULE(_C, m) {
         flex::DetachPool(std::move(owned));
       },
       py::arg("pool"));
+#endif  // TORCH_SPYRE_FLEX
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
@@ -783,6 +801,7 @@ PYBIND11_MODULE(_C, m) {
         py::arg("dst"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
+#ifdef TORCH_SPYRE_FLEX
   // Single KV page copy
   m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
         "Copy one KV cache page between a shared pool slot and the device.\n\n"
@@ -803,12 +822,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("cache"), py::arg("block_id"), py::arg("pool"),
         py::arg("slot_id"), py::arg("to_device"),
         py::call_guard<py::gil_scoped_release>());
+#endif  // TORCH_SPYRE_FLEX
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",
         py::arg("self"), py::arg("value"));
 
+#ifdef TORCH_SPYRE_FLEX
   // Read-only view of a device tensor's CompositeAddress (chunk geometry).
   // The handle keeps the source tensor's allocation alive for its lifetime.
   py::class_<spyre::CompositeChunkInfo>(m, "CompositeChunkInfo")
@@ -847,6 +868,7 @@ PYBIND11_MODULE(_C, m) {
         "Return a read-only handle over the device address backing a Spyre "
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
+#endif  // TORCH_SPYRE_FLEX
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
@@ -916,7 +938,7 @@ PYBIND11_MODULE(_C, m) {
       .def(
           "job_allocation_size",
           [](const spyre::JobPlan& plan) {
-            return plan.job_allocation.at(0).total_size();
+            return plan.job_allocation.at(0)->view().size.raw;
           },
           "Get the size of the job allocation")
       .def(
@@ -964,7 +986,7 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
-               std::to_string(plan.job_allocation.at(0).total_size()) +
+               std::to_string(plan.job_allocation.at(0)->view().size.raw) +
                " expected_inputs=" +
                std::to_string(plan.expected_input_shapes.size()) +
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
@@ -1049,6 +1071,7 @@ PYBIND11_MODULE(_C, m) {
   // same flex path JobPlanStepHostCompute::construct uses (Case 2: no input
   // buffer, no address args) directly. The "_" prefix signals this is not part
   // of the stable public API.
+#ifdef TORCH_SPYRE_FLEX
   m.def(
       "_host_compute_bytes",
       [](const std::string& hcm_json, size_t correction_size) {
@@ -1073,13 +1096,15 @@ PYBIND11_MODULE(_C, m) {
       py::arg("hcm_json"), py::arg("correction_size"),
       "Test-only: run one HostCompute (no args) and return the produced "
       "bytes.");
+#endif  // TORCH_SPYRE_FLEX
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
   // that Python tests can verify what each correction slot resolves to without
   // needing a live HCM or device execution. Returns one integer per slot. An
-  // address slot gives the CompositeAddress* cast to uintptr_t, so the same
-  // tensor yields the same integer and a different tensor a different one, and
-  // a dimension slot gives the size itself. Any ordering bug inside
+  // address slot gives a deterministic digest of its view (region, offset,
+  // size), so the same tensor yields the same integer and a different tensor a
+  // different one. A value slot (a dimension, or a shard's resolved device
+  // address) gives the value itself. Any ordering bug inside
   // resolveSymbolicArgs is therefore visible as a mismatched int vector.
   // The "_" prefix signals this is not part of the stable public API.
   m.def(
@@ -1089,27 +1114,35 @@ PYBIND11_MODULE(_C, m) {
         const auto resolved =
             spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
                                                                symbolic_args);
-        std::vector<uintptr_t> values;
+        std::vector<int64_t> values;
         values.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          // A slot holds an address or a size (a kDimension slot, and a
-          // kShardAddress slot already resolved to a device address), so read
-          // whichever alternative is there rather than naming one: naming the
-          // other kind throws.
-          if (const auto* size = std::get_if<int64_t>(&host_arg)) {
-            values.push_back(static_cast<uintptr_t>(*size));
+          if (host_arg.kind == spyre_rt::HostComputeArgKind::Value) {
+            values.push_back(host_arg.value);
           } else {
-            values.push_back(reinterpret_cast<uintptr_t>(
-                std::get<const flex::CompositeAddress*>(host_arg)));
+            // Deterministic digest of the resolved view: mix region, offset
+            // and size (FNV-1a). Distinct allocations collide only by hash
+            // accident, which is enough for ordering tests.
+            uint64_t h = 1469598103934665603ULL;
+            auto mix = [&h](uint64_t x) {
+              for (int i = 0; i < 8; ++i) {
+                h ^= (x >> (8 * i)) & 0xff;
+                h *= 1099511628211ULL;
+              }
+            };
+            mix(host_arg.view.region.raw);
+            mix(host_arg.view.offset.raw);
+            mix(host_arg.view.size.raw);
+            values.push_back(static_cast<int64_t>(h));
           }
         }
         return values;
       },
       py::arg("tensors"), py::arg("symbolic_args"),
       "Test-only: resolve a symbolic_args payload to a list of integers, one "
-      "per slot. An address slot gives the CompositeAddress* cast to uintptr_t "
-      "and a dimension slot gives the size. Same tensor yields the same "
-      "address integer; a different tensor yields a different one.");
+      "per slot. An address slot gives a digest of its view and a value slot "
+      "(a dimension) gives the value. Same tensor yields the same address "
+      "integer; a different tensor yields a different one.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
@@ -1183,6 +1216,9 @@ PYBIND11_MODULE(_C, m) {
       "Allocate an uninitialized sharded Spyre tensor.");
   m.def("_spyre_is_sharded", &spyre::spyre_is_sharded, py::arg("tensor"),
         "Whether a tensor's storage is sharded storage.");
+#ifdef TORCH_SPYRE_FLEX
+  // Region-map introspection of sharded storage: reads Flex's live
+  // id→region map, which spyre_rt does not expose.
   m.def(
       "_spyre_sharding_info",
       [](const at::Tensor& tensor) {
@@ -1198,18 +1234,18 @@ PYBIND11_MODULE(_C, m) {
         result["shard_dim"] = info.shard_dim;
         result["num_shards"] = info.num_shards;
         result["shard_device_bytes"] = info.shard_device_bytes;
-        result["total_bytes"] = ctx->composite_addr.total_size();
+        result["total_bytes"] = ctx->total_size();
         py::list entries;
         // The shard table is indexed by shard ordinal; shard i backs core i.
         // logical_core_id and is_device_addressable are asserted by
         // construction (identity slot-to-core map; per-shard allocations are
         // device-addressable), not read from Flex; physical placement is
         // read from the live region map.
-        for (size_t i = 0; i < ctx->shard_addrs.size(); ++i) {
-          const flex::Chunk& chunk = ctx->shard_addrs[i].chunks()[0];
-          auto region_it = regions.find(chunk.addr.region_id);
+        for (size_t i = 0; i < ctx->shard_views.size(); ++i) {
+          const spyre_rt::DeviceView& view = ctx->shard_views[i];
+          auto region_it = regions.find(view.region.raw);
           TORCH_CHECK(region_it != regions.end(), "shard ", i,
-                      " references unknown region ", chunk.addr.region_id);
+                      " references unknown region ", view.region.raw);
           const flex::MemoryRegion* region = region_it->second;
           py::dict entry;
           entry["logical_chunk_id"] = i;
@@ -1217,8 +1253,8 @@ PYBIND11_MODULE(_C, m) {
           entry["physical_domain_id"] = region->domainId();
           entry["region_id"] = region->regionId();
           entry["segment_id"] = region->hardwareId();
-          entry["segment_offset_bytes"] = chunk.addr.offset;
-          entry["size_bytes"] = static_cast<uint64_t>(chunk.size);
+          entry["segment_offset_bytes"] = view.offset.raw;
+          entry["size_bytes"] = view.size.raw;
           entry["is_device_addressable"] = true;
           entries.append(entry);
         }
@@ -1227,16 +1263,17 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("tensor"),
       "Address-free sharding record and per-chunk placement receipt.");
+#endif  // TORCH_SPYRE_FLEX
   m.def(
       "num_memory_domains",
       []() -> size_t {
-        auto allocator = flex::RuntimeContext::getInstance()->getAllocator();
-        TORCH_CHECK(allocator != nullptr,
-                    "num_memory_domains requires the Flex runtime to be "
+        auto* runtime = spyre::GlobalRuntime::get();
+        TORCH_CHECK(runtime != nullptr,
+                    "num_memory_domains requires the spyre_rt runtime to be "
                     "initialized");
-        return allocator->topology().numDomains();
+        return runtime->num_domains();
       },
-      "Number of memory domains in the Flex device topology.");
+      "Number of memory domains in the device topology.");
 
   // Allocator statistics functions
   m.def(

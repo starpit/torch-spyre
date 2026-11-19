@@ -20,34 +20,39 @@
 #include <spyrecode-host-functions/sendataconvert/sen_host_ops.h>
 #include <torch/csrc/utils/pybind.h>
 
-#include <flex/flex.hpp>
 #include <memory>
+#include <optional>
+
+#include "spyre_rt.h"
 
 using DataConversionStrideInfo = data_conversion_stride_info;
 using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
+// The process-wide spyre_rt runtime (spyre-torch crate). Created once by
+// startRuntime(); the Box owns the Rust-side Runtime and every stream lives
+// inside it. get() returns a borrowed pointer valid until freeRuntime().
 class GlobalRuntime {
  public:
-  static void set(flex::RuntimeContext* runtime) {
-    instance() = runtime;
+  static void set(rust::Box<spyre_rt::Runtime> runtime) {
+    instance() = std::move(runtime);
   }
 
   static void reset() {
-    instance() = nullptr;
+    instance().reset();
   }
 
-  static flex::RuntimeContext* get() {
-    return instance();
+  static spyre_rt::Runtime* get() {
+    return instance() ? instance()->operator->() : nullptr;
   }
 
  private:
   GlobalRuntime() = delete;
   ~GlobalRuntime() = delete;
 
-  static flex::RuntimeContext*& instance() {
-    static flex::RuntimeContext* s = nullptr;
+  static std::optional<rust::Box<spyre_rt::Runtime>>& instance() {
+    static std::optional<rust::Box<spyre_rt::Runtime>> s;
     return s;
   }
 };

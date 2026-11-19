@@ -17,7 +17,6 @@
 #pragma once
 
 #include <filesystem>  // NOLINT
-#include <flex/flex.hpp>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -27,15 +26,18 @@
 #include <vector>
 
 #include "job_plan.h"
+#include "spyre_rt.h"
 #include "spyre_stream.h"
 
 namespace spyre {
 
-// flex's callback mirror and libaiupti's AIUpti_ActivityCompute::name are
-// assumed to have the same extent. The profiler-enabled build exercises both
-// sides of this transport contract.
-inline constexpr size_t kAIUptiActivityNameMaxBytes =
-    sizeof(flex::aiupti::AIUpti_ActivityCB::name) - 1;
+// The profiler transport bound for compute activity names: one less than the
+// fixed char name[128] buffer both sides copy through (flex's
+// aiupti::AIUpti_ActivityCB::name mirror and libaiupti's
+// AIUpti_ActivityCompute::name are assumed to have the same extent; see
+// flex/telemetry/aiupti_activity.hpp). The profiler-enabled build exercises
+// both sides of this transport contract.
+inline constexpr size_t kAIUptiActivityNameMaxBytes = 127;
 
 /**
  * @brief Builder class for constructing JobPlan from SpyreCode
@@ -159,9 +161,13 @@ class JobPlanBuilder {
   /// the no-cache/KTIR path (first 8 of the UUID). Emitted in trace args
   /// as sdsc_bundle_dir_prefix regardless of whether provenance is set.
   const std::string sdsc_bundle_dir_prefix_;
-  /// Device memory allocation for the job (set during preparation and moved to
-  /// JobPlan in translation)
-  std::vector<flex::CompositeAddress> job_allocation_;
+  /// Device memory allocation for the job (set during preparation and moved
+  /// to JobPlan in translation): the single owning allocation. The programs
+  /// live inside it as offset views, collected in program_views_.
+  std::vector<rust::Box<spyre_rt::Allocation>> job_allocation_;
+  /// Non-owning views of each program inside job_allocation_'s allocation
+  /// (the vendor's job_allocation_[1..] entries).
+  std::vector<spyre_rt::DeviceView> program_views_;
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
 
