@@ -129,7 +129,7 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       program_address_, spyre_rt::BootstrapOffset{bootstrap_offset_},
       rust::Slice<const spyre_rt::DeviceView>(tensor_views.data(),
                                               tensor_views.size()),
-      step_barrier(pipeline_barrier_));
+      rust::Str(name_), step_barrier(pipeline_barrier_));
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -249,8 +249,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // returning, Flex #1990): the bytes are ready before S_dev receives the
   // consuming compute, regardless of hazard tracking. The runtime owns the
   // produced Corrections and drops them at upload completion.
-  rust::Box<spyre_rt::Corrections> corrections =
-      GlobalRuntime::get()->host_compute(
+  spyre_rt::CorrectionsHandle corrections =
+      stream.hostComputeStep(
           *handle_, spyre_rt::ByteSize{correction_size_},
           static_cast<const uint8_t*>(input_buffer_),
           rust::Slice<const spyre_rt::HostComputeArg>(args.data(),
@@ -258,7 +258,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
 
   // Enforce that the produced correction size matches the expected device
   // allocation size.
-  TORCH_DCHECK_EQ(corrections->size().raw, device_address_.size.raw);
+  TORCH_DCHECK_EQ(GlobalRuntime::get()->corrections_size(corrections).raw,
+                  device_address_.size.raw);
 
 #ifdef TORCH_SPYRE_FLEX
   // VF-only compound correction submission: PF's maxProgramCorrections() is 0
@@ -274,7 +275,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   }
 #endif
 
-  stream.uploadCorrectionsStep(std::move(corrections), device_address_,
+  stream.uploadCorrectionsStep(corrections, device_address_,
                                step_barrier(pipeline_barrier_));
 }
 

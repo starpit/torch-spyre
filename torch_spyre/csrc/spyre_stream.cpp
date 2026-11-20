@@ -376,15 +376,8 @@ const spyre_rt::Stream* SpyreStream::resolveRuntimeHandle() const {
 }
 
 SpyreStreamError SpyreStream::getError() const {
-  // The vendor rolls per-stream needsShutdown() up against the runtime's
-  // aggregate hasStreamError(); the two agree while both reduce to
-  // needsShutdown() (module.cpp note on SpyreGetDeviceState).
-  auto* runtime = GlobalRuntime::get();
-  if (!runtime) {
-    return SpyreStreamError::Success;
-  }
-  return runtime->has_stream_error() ? SpyreStreamError::Shutdown
-                                     : SpyreStreamError::Success;
+  return resolveRuntimeHandle()->needs_shutdown() ? SpyreStreamError::Shutdown
+                                                  : SpyreStreamError::Success;
 }
 
 void SpyreStream::copyAsyncImpl(
@@ -437,18 +430,34 @@ void SpyreStream::copyD2H(spyre_rt::DeviceView src, uint8_t* dst,
 
 void SpyreStream::launchComputeStep(
     spyre_rt::DeviceView program, spyre_rt::BootstrapOffset bootstrap,
-    rust::Slice<const spyre_rt::DeviceView> tensors,
+    rust::Slice<const spyre_rt::DeviceView> tensors, rust::Str name,
     spyre_rt::PipelineBarrier barrier) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launch_compute(program, bootstrap, tensors, barrier);
+  resolveRuntimeHandle()->launch_compute(program, bootstrap, tensors, name,
+                                          barrier);
 }
 
 void SpyreStream::uploadCorrectionsStep(
-    rust::Box<spyre_rt::Corrections> corrections, spyre_rt::DeviceView dst,
+    spyre_rt::CorrectionsHandle corrections, spyre_rt::DeviceView dst,
     spyre_rt::PipelineBarrier barrier) const {
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->upload_corrections(std::move(corrections), dst,
-                                             barrier);
+  const spyre_rt::Stream* handle = nullptr;
+  try {
+    handle = resolveRuntimeHandle();
+  } catch (...) {
+    GlobalRuntime::get()->release_corrections(corrections);
+    throw;
+  }
+  handle->upload_corrections(corrections, dst, barrier);
+}
+
+spyre_rt::CorrectionsHandle SpyreStream::hostComputeStep(
+    const spyre_rt::HostComputeHandle& handle,
+    spyre_rt::ByteSize correction_size, const uint8_t* input,
+    rust::Slice<const spyre_rt::HostComputeArg> args) const {
+  return GlobalRuntime::get()->host_compute(*resolveRuntimeHandle(),
+                                             handle, correction_size,
+                                             input, args);
 }
 
 void SpyreStream::fill(spyre_rt::DeviceView dst, double value,

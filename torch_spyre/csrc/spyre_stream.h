@@ -65,11 +65,15 @@ class SpyreStream {
                spyre_rt::PipelineBarrier barrier) const;
   void launchComputeStep(
       spyre_rt::DeviceView program, spyre_rt::BootstrapOffset bootstrap,
-      rust::Slice<const spyre_rt::DeviceView> tensors,
+      rust::Slice<const spyre_rt::DeviceView> tensors, rust::Str name,
       spyre_rt::PipelineBarrier barrier) const;
-  void uploadCorrectionsStep(rust::Box<spyre_rt::Corrections> corrections,
+  void uploadCorrectionsStep(spyre_rt::CorrectionsHandle corrections,
                              spyre_rt::DeviceView dst,
                              spyre_rt::PipelineBarrier barrier) const;
+  spyre_rt::CorrectionsHandle hostComputeStep(
+      const spyre_rt::HostComputeHandle& handle,
+      spyre_rt::ByteSize correction_size, const uint8_t* input,
+      rust::Slice<const spyre_rt::HostComputeArg> args) const;
   // Device-side fill (the vendor's FillAsync MEMORY_FILL DMA).
   void fill(spyre_rt::DeviceView dst, double value,
             spyre_rt::DataFormat format) const;

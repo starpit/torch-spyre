@@ -85,7 +85,7 @@ static void check_collective_errors(spyre_comms::WorkSchedule& work) {
   // RuntimeContext::hasStreamError() aggregates all registered streams, so a
   // fault on an unrelated non-default stream would incorrectly reject a
   // successful collective.
-  TORCH_CHECK(!spyre::getDefaultStreamRuntimeHandle()->needsShutdown(),
+  TORCH_CHECK(!spyre::getDefaultStreamRuntimeHandle()->needs_shutdown(),
               "[SpyreCCL]: device stream error during collective");
 }
 
