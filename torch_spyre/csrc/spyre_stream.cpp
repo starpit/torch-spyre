@@ -235,7 +235,9 @@ void SpyreStream::synchronize() const {
   SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
                         << static_cast<int>(device().index());
 
-  resolveRuntimeHandle()->synchronize();
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->synchronize(t);
+  });
 }
 
 c10::Stream SpyreStream::unwrap() const {
@@ -393,23 +395,32 @@ void SpyreStream::copyAsyncImpl(
   const spyre_rt::ByteSize capacity{host_capacity};
   if (host2device) {
     if (dci != nullptr) {
-      handle->copy_h2d_converted(static_cast<const uint8_t*>(cpu_ptr),
-                                 capacity, *device_address, *dci,
-                                 spyre_rt::PipelineBarrier::No);
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        handle->copy_h2d_converted(t, static_cast<const uint8_t*>(cpu_ptr),
+                                   capacity, *device_address, *dci,
+                                   spyre_rt::PipelineBarrier::No);
+      });
     } else {
-      handle->copy_h2d(static_cast<const uint8_t*>(cpu_ptr), capacity,
-                       *device_address, std::move(keep),
-                       spyre_rt::PipelineBarrier::No);
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        handle->copy_h2d(t, static_cast<const uint8_t*>(cpu_ptr), capacity,
+                         *device_address, std::move(keep),
+                         spyre_rt::PipelineBarrier::No);
+      });
     }
   } else {
     if (dci != nullptr) {
-      handle->copy_d2h_converted(*device_address, static_cast<uint8_t*>(cpu_ptr),
-                                 capacity, *dci, std::move(keep),
-                                 spyre_rt::PipelineBarrier::No);
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        handle->copy_d2h_converted(t, *device_address,
+                                   static_cast<uint8_t*>(cpu_ptr), capacity,
+                                   *dci, std::move(keep),
+                                   spyre_rt::PipelineBarrier::No);
+      });
     } else {
-      handle->copy_d2h(*device_address, static_cast<uint8_t*>(cpu_ptr),
-                       capacity, std::move(keep),
-                       spyre_rt::PipelineBarrier::No);
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        handle->copy_d2h(t, *device_address, static_cast<uint8_t*>(cpu_ptr),
+                         capacity, std::move(keep),
+                         spyre_rt::PipelineBarrier::No);
+      });
     }
   }
 }
@@ -418,14 +429,20 @@ void SpyreStream::copyH2D(const uint8_t* src, spyre_rt::ByteSize src_capacity,
                           spyre_rt::DeviceView dst,
                           spyre_rt::PipelineBarrier barrier) const {
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->copy_h2d(src, src_capacity, dst, nullptr, barrier);
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->copy_h2d(t, src, src_capacity, dst, nullptr,
+                                     barrier);
+  });
 }
 
 void SpyreStream::copyD2H(spyre_rt::DeviceView src, uint8_t* dst,
                           spyre_rt::ByteSize dst_capacity,
                           spyre_rt::PipelineBarrier barrier) const {
   RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->copy_d2h(src, dst, dst_capacity, nullptr, barrier);
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->copy_d2h(t, src, dst, dst_capacity, nullptr,
+                                     barrier);
+  });
 }
 
 void SpyreStream::launchComputeStep(
@@ -433,8 +450,10 @@ void SpyreStream::launchComputeStep(
     rust::Slice<const spyre_rt::DeviceView> tensors, rust::Str name,
     spyre_rt::PipelineBarrier barrier) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launch_compute(program, bootstrap, tensors, name,
-                                          barrier);
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->launch_compute(t, program, bootstrap, tensors,
+                                           name, barrier);
+  });
 }
 
 void SpyreStream::uploadCorrectionsStep(
@@ -445,25 +464,33 @@ void SpyreStream::uploadCorrectionsStep(
   try {
     handle = resolveRuntimeHandle();
   } catch (...) {
-    GlobalRuntime::get()->release_corrections(corrections);
+    spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+      GlobalRuntime::get()->release_corrections(t, corrections);
+    });
     throw;
   }
-  handle->upload_corrections(corrections, dst, barrier);
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    handle->upload_corrections(t, corrections, dst, barrier);
+  });
 }
 
 spyre_rt::CorrectionsHandle SpyreStream::hostComputeStep(
     const spyre_rt::HostComputeHandle& handle,
     spyre_rt::ByteSize correction_size, const uint8_t* input,
     rust::Slice<const spyre_rt::HostComputeArg> args) const {
-  return GlobalRuntime::get()->host_compute(*resolveRuntimeHandle(),
-                                             handle, correction_size,
-                                             input, args);
+  return spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    return GlobalRuntime::get()->host_compute(t, *resolveRuntimeHandle(),
+                                              handle, correction_size,
+                                              input, args);
+  });
 }
 
 void SpyreStream::fill(spyre_rt::DeviceView dst, double value,
                        spyre_rt::DataFormat format) const {
   RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->fill(dst, value, format);
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->fill(t, dst, value, format);
+  });
 }
 
 void SpyreStream::launch(const JobPlan& plan,
@@ -588,11 +615,15 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         "Host compute stream id ", sid,
         " is already registered; only one Spyre device per process is "
         "supported.");
-    pool.stream_handle_map[sid] = &runtime->create_stream(
-        spyre_rt::StreamPriority::Normal, spyre_rt::StreamOrdering::Strict,
-        /*track_hazards=*/get_hazard_tracker_enabled()
-            ? spyre_rt::HazardTracking::Tracked
-            : spyre_rt::HazardTracking::Untracked);
+    pool.stream_handle_map[sid] = &spyre_rt::vendor(
+        [&](spyre_rt::Thrown& t) -> decltype(auto) {
+          return runtime->create_stream(
+              t, spyre_rt::StreamPriority::Normal,
+              spyre_rt::StreamOrdering::Strict,
+              /*track_hazards=*/get_hazard_tracker_enabled()
+                  ? spyre_rt::HazardTracking::Tracked
+                  : spyre_rt::HazardTracking::Untracked);
+        });
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -743,11 +774,14 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     spyre_rt::StreamPriority streamPriority =
         priority < 0 ? spyre_rt::StreamPriority::High
                      : spyre_rt::StreamPriority::Normal;
-    const spyre_rt::Stream* handle = &runtime->create_stream(
-        streamPriority, spyre_rt::StreamOrdering::Strict,
-        /*track_hazards=*/get_hazard_tracker_enabled()
-            ? spyre_rt::HazardTracking::Tracked
-            : spyre_rt::HazardTracking::Untracked);
+    const spyre_rt::Stream* handle = &spyre_rt::vendor(
+        [&](spyre_rt::Thrown& t) -> decltype(auto) {
+          return runtime->create_stream(
+              t, streamPriority, spyre_rt::StreamOrdering::Strict,
+              /*track_hazards=*/get_hazard_tracker_enabled()
+                  ? spyre_rt::HazardTracking::Tracked
+                  : spyre_rt::HazardTracking::Untracked);
+        });
     pool.stream_handle_map[stream_id] = handle;
   }
 
@@ -789,7 +823,8 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
 
     c10::DeviceGuard guard(dev);
     for (auto handle : handles_to_sync) {
-      handle->synchronize();
+      spyre_rt::vendor(
+          [&](spyre_rt::Thrown& t) { handle->synchronize(t); });
     }
   };
   if (device.has_value()) {
@@ -826,7 +861,8 @@ SpyreDeviceState SpyreGetDeviceState() {
   // TODO(#3365): once the runtime exposes typed per-stream codes, roll up via
   // SpyreStreamGetError so the aggregate (and the pytest skip reason) can
   // surface the actual fault class.
-  if (runtime->has_stream_error()) {
+  if (spyre_rt::vendor(
+          [&](spyre_rt::Thrown& t) { return runtime->has_stream_error(t); })) {
     return SpyreDeviceState::StreamError;
   }
   return SpyreDeviceState::Ok;

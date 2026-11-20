@@ -158,8 +158,11 @@ void _startRuntime() {
 
   // create_runtime never returns null: it returns the runtime or throws.
   rust::Box<spyre_rt::Runtime> runtime =
-      spyre_rt::create_runtime(spyre_rt::DeviceIndex{
-          static_cast<uint32_t>(logical_device_id)});
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        return spyre_rt::create_runtime(
+            t, spyre_rt::DeviceIndex{
+                   static_cast<uint32_t>(logical_device_id)});
+      });
   init_from_env();
   GlobalRuntime::set(std::move(runtime));
   // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
@@ -1247,6 +1250,39 @@ PYBIND11_MODULE(_C, m) {
         return runtime->num_domains().raw;
       },
       "Number of memory domains in the device topology.");
+  m.def(
+      "_device_busy",
+      []() -> py::dict {
+        auto* runtime = spyre::GlobalRuntime::get();
+        TORCH_CHECK(runtime != nullptr,
+                    "_device_busy requires the spyre_rt runtime to be "
+                    "initialized");
+        const spyre_rt::DeviceBusy busy = runtime->device_busy();
+        py::dict result;
+        result["compute_ns"] = busy.compute.raw;
+        result["dma_in_ns"] = busy.dma_in.raw;
+        result["dma_out_ns"] = busy.dma_out.raw;
+        result["fills"] = busy.fills.raw;
+        result["responses"] = busy.responses.raw;
+        return result;
+      },
+      "The card's cumulative device time and response counts.");
+  m.def(
+      "_host_compute_stats",
+      []() -> py::dict {
+        auto* runtime = spyre::GlobalRuntime::get();
+        TORCH_CHECK(runtime != nullptr,
+                    "_host_compute_stats requires the spyre_rt runtime to "
+                    "be initialized");
+        const spyre_rt::HostComputeStats stats =
+            runtime->host_compute_stats();
+        py::dict result;
+        result["calls"] = stats.calls.raw;
+        result["deeptools_ns"] = stats.deeptools.raw;
+        result["total_ns"] = stats.total.raw;
+        return result;
+      },
+      "The runtime's cumulative host-compute calls and wall time.");
 
   // Allocator statistics functions
   m.def(

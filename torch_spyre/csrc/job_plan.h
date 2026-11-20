@@ -588,7 +588,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         // This will internally create the fast_plan for deeptools. (In the
         // member-init list: rust::Box is move-constructible but not
         // assignable.)
-        handle_(spyre_rt::create_host_compute_handle(std::move(hcm))) {
+        handle_(spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+          return spyre_rt::create_host_compute_handle(t, std::move(hcm));
+        })) {
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing

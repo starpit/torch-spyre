@@ -65,7 +65,9 @@ std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
   // device; spyre_rt owns one device per process, so the index must be 0
   // (or -1 resolved to it) exactly as before.
   spyre_rt::MemoryStats mem_stats =
-      runtime->memory_stats(spyre_rt::MemoryType::Tensor);
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        return runtime->memory_stats(t, spyre_rt::MemoryType::Tensor);
+      });
   return {mem_stats.free.raw, mem_stats.total.raw};
 }
 
@@ -185,9 +187,13 @@ c10::DataPtr SpyreAllocator::allocate(
               "SpyreAllocator::allocate: the spyre_rt runtime is not "
               "initialized (was start_runtime called?)");
 
-  rust::Box<spyre_rt::Allocation> allocation = runtime->allocate(
-      spyre_rt::ByteSize{nbytes}, memory_type,
-      rust::Slice<const spyre_rt::DomainId>(domains.data(), domains.size()));
+  rust::Box<spyre_rt::Allocation> allocation =
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        return runtime->allocate(
+            t, spyre_rt::ByteSize{nbytes}, memory_type,
+            rust::Slice<const spyre_rt::DomainId>(domains.data(),
+                                                  domains.size()));
+      });
 
   auto* ctx = new SharedOwnerCtx(std::move(allocation), device_id,
                                  memory_type);
@@ -241,10 +247,14 @@ c10::DataPtr SpyreAllocator::allocateShardedStorage(
   for (uint32_t i = 0; i < logical_chunks; ++i) {
     std::vector<spyre_rt::DomainId> domains{
         spyre_rt::DomainId{i % num_domains}};
-    shard_allocations.push_back(runtime->allocate(
-        spyre_rt::ByteSize{shard_device_bytes},
-        spyre_rt::MemoryType::Tensor,
-        rust::Slice<const spyre_rt::DomainId>(domains.data(), domains.size())));
+    shard_allocations.push_back(
+        spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+          return runtime->allocate(
+              t, spyre_rt::ByteSize{shard_device_bytes},
+              spyre_rt::MemoryType::Tensor,
+              rust::Slice<const spyre_rt::DomainId>(domains.data(),
+                                                    domains.size()));
+        }));
     shard_views.push_back(shard_allocations.back()->view());
     TORCH_CHECK(shard_views.back().size.raw == shard_device_bytes,
                 "plain per-shard allocation ", i, " covers ",

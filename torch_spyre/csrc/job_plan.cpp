@@ -258,7 +258,10 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
 
   // Enforce that the produced correction size matches the expected device
   // allocation size.
-  TORCH_DCHECK_EQ(GlobalRuntime::get()->corrections_size(corrections).raw,
+  TORCH_DCHECK_EQ(spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+                    return GlobalRuntime::get()->corrections_size(t,
+                                                                  corrections);
+                  }).raw,
                   device_address_.size.raw);
 
 #ifdef TORCH_SPYRE_FLEX
