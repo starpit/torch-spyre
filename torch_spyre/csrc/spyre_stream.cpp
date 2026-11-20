@@ -494,7 +494,17 @@ void SpyreStream::launch(const JobPlan& plan,
   // plans never split. This switch controls stream splitting only: eligible
   // correction batching is enabled in both topologies, including the
   // single-stream path.
+#ifndef TORCH_SPYRE_FLEX
+  // Our runtime (this PoC build; TORCH_SPYRE_FLEX undefined) runs host
+  // compute on the caller, not on a scheduler thread: the vendor's
+  // reason for the two-stream split (scheduler-thread host compute
+  // overlapping S_dev) does not exist here, and the split only adds a
+  // cross-stream wait per kernel. Every Prep step rides S_dev in launch
+  // order.
+  const bool should_split = false;
+#else
   const bool should_split = get_hazard_tracker_enabled();
+#endif
   for (size_t i = 0; i < plan.steps.size(); ++i) {
     const auto& step = plan.steps[i];
     const auto kind = classifyStep(*step);
