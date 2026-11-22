@@ -2500,8 +2500,31 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the underlying tensor, or a CPU copy, instead.");
   const at::TensorBase& root =
       self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  // A tensor over a Spyre storage need not be a SpyreTensorImpl: ATen builds a
+  // dtype view (view_dtype, e.g. kv.view(torch.uint8)) as a plain TensorImpl
+  // over the same storage and does not track it as a view, so it is its own
+  // root and carries no layout. The only extent it can be checked against is
+  // its storage's: it must start at storage offset 0 and span every byte, and
+  // then, being dense, it is the whole storage the fill writes.
   const auto* root_impl =
-      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+      dynamic_cast<const SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  if (root_impl == nullptr) {
+    const size_t span_bytes =
+        static_cast<size_t>(self.numel()) * self.element_size();
+    TORCH_CHECK(self.storage_offset() == 0 &&
+                    span_bytes == self.storage().nbytes(),
+                "fill_/zero_ of a partial view of a Spyre tensor is not "
+                "supported yet: the device fill writes whole sticks of the "
+                "storage, so it would also overwrite the bytes outside the "
+                "view (a view with no Spyre layout, such as a dtype view: ",
+                self.sizes(), " of ", self.scalar_type(), " at storage offset ",
+                self.storage_offset(), " spans ", span_bytes, " of the ",
+                self.storage().nbytes(),
+                " storage bytes). Fill the whole tensor, or fill a CPU copy "
+                "and copy it back.");
+    launch_device_fill(get_composite_address(self), value, self.scalar_type());
+    return self;
+  }
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
   if (root_impl->has_intact_reservation()) {
     whole_elements = root.numel();
