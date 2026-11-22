@@ -21,6 +21,8 @@ os.environ.setdefault(
 )  # must be before torch import
 
 import glob
+import json
+import subprocess
 
 from setuptools import Command, setup
 
@@ -44,49 +46,106 @@ PROFILER_SRC_DIR = CSRC_DIR / "profiler"
 
 
 # The senlib-rs checkout whose spyre-torch crate this build links (the
-# staticlib with the cxx bridge's Rust half, and everything below it). The
-# crate MUST be built first (`cargo build --release -p spyre-torch
-# --features snt1p0`, OCO route, CPATH=$DEEPTOOLS_INSTALL_DIR/include):
-# cxx-build writes the GENERATED bridge header and the version-matched
-# rust/cxx.h into its out dir, and the build-hash directory name changes
-# across clean builds, so it is discovered, never hardcoded.
+# staticlib with the cxx bridge's Rust half, and everything below it), and
+# the OCO config the recipe of record passes to cargo (the [patch] that
+# redirects the export-controlled stub). Both are REQUIRED inputs with no
+# defaults: this setup.py is the ONE cargo invocation for spyre-torch, so
+# the include dir and the .a the csrc compiles and links against are taken
+# from THAT invocation's build messages — never discovered, guessed, or
+# overridden.
 SENLIB_RS_DIR = Path(os.environ["SENLIB_RS_DIR"])
-SENLIB_RS_TARGET = SENLIB_RS_DIR / "target" / "release"
+OCO_CONFIG = os.environ["OCO"]
 
 
-def find_cxxbridge_include():
-    """The one cxxbridge out dir holding bridge.rs.h and rust/cxx.h.
+def build_spyre_torch():
+    """Run the single cargo build of spyre-torch and return (include_dir, a_path).
 
-    Globs the crate's build dirs for the generated header and fails loudly
-    when spyre-torch has not been built (or was cleaned): the csrc includes
-    `spyre-torch/src/bridge.rs.h` through it.
+    `cargo build --release -p spyre-torch --features snt1p0 --config <OCO>
+    --message-format=json-render-diagnostics` is run in the senlib-rs tree.
+    An up-to-date tree is a no-op build that still names its artifacts:
+    cargo emits the build-script-executed and compiler-artifact messages
+    for fresh units too. The include dir comes from the build-script-
+    executed message's out_dir (cxx-build writes the GENERATED bridge
+    header and the version-matched rust/cxx.h under out/cxxbridge/include);
+    the .a comes from the compiler-artifact message for the staticlib.
     """
-    candidates = sorted(
-        (SENLIB_RS_TARGET / "build").glob(
-            "spyre-torch-*/out/cxxbridge/include/spyre-torch/src/bridge.rs.h"
-        )
+    cmd = [
+        "cargo", "build", "--release", "-p", "spyre-torch",
+        "--features", "snt1p0", "--config", OCO_CONFIG,
+        "--message-format=json-render-diagnostics",
+    ]
+    proc = subprocess.run(
+        cmd, cwd=SENLIB_RS_DIR, capture_output=True, text=True
     )
-    if not candidates:
+    if proc.returncode != 0:
         raise RuntimeError(
-            "spyre-torch has not been built under "
-            f"{SENLIB_RS_TARGET}: no cxxbridge include dir with "
-            "spyre-torch/src/bridge.rs.h. Build it first: "
-            "cargo build --release -p spyre-torch --features snt1p0 "
-            "(OCO route, CPATH=$DEEPTOOLS_INSTALL_DIR/include)."
+            f"cargo build of spyre-torch failed (rc={proc.returncode}):\n"
+            f"{proc.stdout}\n{proc.stderr}"
         )
-    if len(candidates) > 1:
-        # More than one build dir holds a bridge header (a stale one from a
-        # source change, or several feature variants): pick nothing on a
-        # guess — name them and stop.
+    # A [patch] that cargo silently ignored (wrong path in the OCO config)
+    # builds the export-controlled STUB instead of the real red crate — a
+    # runtime panic, not a build error. Cargo warns "was not used in the
+    # crate graph" on stderr when this happens; that warning is a build
+    # failure here.
+    if "was not used in the crate graph" in (proc.stdout + proc.stderr):
         raise RuntimeError(
-            "multiple spyre-torch cxxbridge include dirs found: "
-            + ", ".join(str(c) for c in candidates)
-            + " — clean the stale ones and rebuild."
+            "cargo reported a [patch] 'was not used in the crate graph': "
+            "the OCO config's patch path does not match the tree — refusing "
+            "to build (the export-controlled stub would panic at runtime).\n"
+            f"{proc.stderr}"
         )
-    # candidates[0] is .../cxxbridge/include/spyre-torch/src/bridge.rs.h;
-    # the include dir to compile against is .../cxxbridge/include, which
-    # also holds the version-matched rust/cxx.h.
-    return candidates[0].parents[2]
+    # The build's own messages, dumped verbatim next to this setup.py for
+    # inspection when a required message is missing (the artifact paths the
+    # build consumed are already taken from this same stdout in-memory).
+    (ROOT_DIR / "cargo-messages.json").write_text(proc.stdout)
+
+    include_dir = None
+    a_path = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # A workspace member's package_id is "path+file://<tree>/crates/
+        # spyre-torch#<version>" (only registry deps front their name in
+        # package_id), and build-script-executed messages carry NO
+        # manifest_path — so package_id is the one field that identifies
+        # spyre-torch in every message kind.
+        package_id = msg.get("package_id", "")
+        if "crates/spyre-torch#" not in package_id:
+            continue
+        reason = msg.get("reason")
+        if reason == "build-script-executed":
+            out_dir = msg.get("out_dir")
+            if out_dir:
+                include_dir = Path(out_dir) / "cxxbridge" / "include"
+        elif reason == "compiler-artifact":
+            # The package_id filter above already scopes to spyre-torch;
+            # its lib target is named spyre_torch (underscore) with kind
+            # ["staticlib", "rlib"].
+            target = msg.get("target", {})
+            if "staticlib" in target.get("kind", []):
+                for f in msg.get("filenames", []):
+                    if f.endswith(".a"):
+                        a_path = Path(f)
+    if include_dir is None:
+        raise RuntimeError(
+            "the cargo build of spyre-torch emitted no build-script-executed "
+            "message with an out_dir: no cxxbridge include dir to compile the "
+            "csrc against"
+        )
+    if a_path is None:
+        raise RuntimeError(
+            "the cargo build of spyre-torch emitted no compiler-artifact "
+            "message for its staticlib: no libspyre_torch.a to link"
+        )
+    return include_dir, a_path
+
+
+CXXBRIDGE_INCLUDE, SPYRE_TORCH_A = build_spyre_torch()
 
 
 # Automatically download json.hpp if not present
@@ -111,11 +170,12 @@ def maybe_download_nlohmann_json():
 
 INCLUDE_DIRS = [
     CSRC_DIR,
-    # The crate's cxx-build output: the GENERATED bridge header
-    # (spyre-torch/src/bridge.rs.h — the API the whole csrc calls) and the
-    # version-matched rust/cxx.h (the crate pins cxx =1.0.205). Discovered
-    # from the build output; nothing is vendored.
-    find_cxxbridge_include(),
+    # The cxx-build output of THE cargo build this setup.py ran: the
+    # GENERATED bridge header (spyre-torch/src/bridge.rs.h — the API the
+    # whole csrc calls) and the version-matched rust/cxx.h (the crate pins
+    # cxx =1.0.205). Taken from the build's own messages; nothing is
+    # vendored, discovered, or overridden.
+    CXXBRIDGE_INCLUDE,
     # The generated header does #include "spyre-torch/include/spyre_torch.h"
     # (the crate's consumer-contract header, which names the deeptools types
     # the bridge passes through and the memory-pressure callback), rooted at
@@ -125,8 +185,9 @@ INCLUDE_DIRS = [
 ]
 LIBRARY_DIRS = [
     # The spyre-torch staticlib (the cxx bridge's Rust half, with everything
-    # below it: flex-rs, senlib-rs, the export-controlled values).
-    SENLIB_RS_TARGET,
+    # below it: flex-rs, senlib-rs, the export-controlled values), from the
+    # same cargo build's compiler-artifact message.
+    SPYRE_TORCH_A.parent,
 ]
 
 
