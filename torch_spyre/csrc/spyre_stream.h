@@ -78,6 +78,13 @@ class SpyreStream {
   void fill(spyre_rt::DeviceView dst, double value,
             spyre_rt::DataFormat format) const;
 
+  // Tensor parallelism (spyre_rt): send `src` card to card to rank `to` at
+  // `parity`, and hold this stream until every peer's message at `parity`
+  // has landed (distributed_rt/spyre_rt_ccl.cpp).
+  void tpSend(const spyre_rt::Runtime& rt, uint8_t to, uint8_t parity,
+              spyre_rt::DeviceView src) const;
+  void tpWait(const spyre_rt::Runtime& rt, uint8_t parity) const;
+
   // Conversions
   c10::Stream unwrap() const;
 

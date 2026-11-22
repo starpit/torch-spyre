@@ -493,6 +493,21 @@ void SpyreStream::fill(spyre_rt::DeviceView dst, double value,
   });
 }
 
+void SpyreStream::tpSend(const spyre_rt::Runtime& rt, uint8_t to,
+                         uint8_t parity, spyre_rt::DeviceView src) const {
+  RECORD_FUNCTION("launch::TpSend", {});
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->tp_send(t, rt, to, parity, src);
+  });
+}
+
+void SpyreStream::tpWait(const spyre_rt::Runtime& rt, uint8_t parity) const {
+  RECORD_FUNCTION("launch::TpWait", {});
+  spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+    resolveRuntimeHandle()->tp_wait(t, rt, parity);
+  });
+}
+
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args,
                          std::vector<SymbolicArg> symbolic_args) const {

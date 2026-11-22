@@ -48,6 +48,19 @@
 #include "distributed/spyre_ccl.hpp"
 #endif
 
+#ifdef USE_SPYRE_RT_CCL
+#include <pybind11/chrono.h>
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+
+// The spyre_rt build's card-to-card collectives (distributed_rt/).
+namespace spyre::rt_ccl {
+c10::intrusive_ptr<c10d::Backend> create_backend(
+    const c10::intrusive_ptr<c10d::Store>& store, int rank, int size,
+    const std::chrono::duration<float>& timeout);
+}  // namespace spyre::rt_ccl
+#endif
+
 #ifdef TORCH_SPYRE_FLEX
 #include <flex/flex.hpp>
 #endif
@@ -931,6 +944,12 @@ PYBIND11_MODULE(_C, m) {
   // Spyre CCL distributed backend
   m.def("createSpyreCCLBackend", &c10d::SpyreCCLBackend::createSpyreCCLBackend,
         "Create the Spyre Collective Library Backend object");
+#endif
+
+#ifdef USE_SPYRE_RT_CCL
+  // The spyre_rt build's card-to-card collectives, under the same name.
+  m.def("createSpyreCCLBackend", &spyre::rt_ccl::create_backend,
+        "Create the card-to-card collective backend");
 #endif
 
   py::class_<spyre::JobPlan>(m, "JobPlan")

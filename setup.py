@@ -42,6 +42,9 @@ def check_libflex():
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
 DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
+# The spyre_rt build's collectives: card to card over the senlib-rs bridge,
+# no collective library. Compiled whenever spyre-comms is not (USE_SPYRE_CCL=0).
+DISTRIBUTED_RT_SRC_DIR = CSRC_DIR / "distributed_rt"
 PROFILER_SRC_DIR = CSRC_DIR / "profiler"
 
 
@@ -343,7 +346,9 @@ if __name__ == "__main__":
             list(PROFILER_SRC_DIR.glob("*.cpp")) if COMPILE_AIUPTI else []
         )
         distributed_sources = (
-            list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
+            list(DISTRIBUTED_SRC_DIR.glob("*.cpp"))
+            if use_spyre_ccl
+            else list(DISTRIBUTED_RT_SRC_DIR.glob("*.cpp"))
         )
 
         core_src_paths = [p.relative_to(ROOT_DIR).as_posix() for p in sorted(sources)]
@@ -363,6 +368,8 @@ if __name__ == "__main__":
         ]
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
+        else:
+            base_define_macros.append(("USE_SPYRE_RT_CCL", None))
 
         # TORCH_SPYRE_FLEX is deliberately NEVER defined in the spyre_rt build:
         # every flex-only surface (pools, pinned allocator, CopyRaw KV offload,
