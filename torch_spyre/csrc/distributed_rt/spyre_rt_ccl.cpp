@@ -42,6 +42,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../module.h"
@@ -292,6 +293,49 @@ at::Tensor wait_work(const at::Tensor& tensor) {
   return tensor;
 }
 
+// ---- the compiled path's in-graph all-reduce ------------------------------
+// The compiled graph sums the parts itself, in one kernel of its own, with the
+// device layouts it knows (an eager add or out= op writes the default layout,
+// and a graph buffer's layout is not always that). Two ops serve it:
+//  - tp_exchange_run(input): this rank's tensor into its OWN slot (a copy_,
+//    exact) and into every peer's slot for it, then the wait. Every part of
+//    the collective now sits in this card's window, so the graph reads part r
+//    from the window for every r and is the same graph on every rank. The
+//    parity is recorded against input's storage.
+//  - tp_part_run(input, part): rank `part`'s message of input's last
+//    exchange, borrowed from the window and laid out as input.
+
+std::unordered_map<const c10::StorageImpl*, uint8_t>& exchanged() {
+  static std::unordered_map<const c10::StorageImpl*, uint8_t> m;
+  return m;
+}
+
+void tp_exchange_run(const at::Tensor& input, int64_t) {
+  const auto src = whole_storage(input, "all_reduce");
+  const auto parity = exchange(input, src);
+  // No peer writes this rank's own slot, so it is filled after the exchange.
+  auto& w = world();
+  slot_tensor(w.rank, parity, input, src.size.raw).copy_(input);
+  std::lock_guard<std::mutex> lock(w.mu);
+  exchanged()[input.storage().unsafeGetStorageImpl()] = parity;
+}
+
+at::Tensor tp_part_run(const at::Tensor& input, int64_t, int64_t part) {
+  auto& w = world();
+  TORCH_CHECK(part >= 0 && part < w.size, "spyreccl: part ", part,
+              " in a world of ", w.size);
+  uint8_t parity = 0;
+  {
+    std::lock_guard<std::mutex> lock(w.mu);
+    const auto it = exchanged().find(input.storage().unsafeGetStorageImpl());
+    TORCH_CHECK(it != exchanged().end(),
+                "spyreccl: a part of a tensor this rank never exchanged");
+    parity = it->second;
+  }
+  return slot_tensor(static_cast<int>(part), parity, input,
+                     get_composite_address(input)->size.raw);
+}
+
 }  // namespace spyre::rt_ccl
 
 TORCH_LIBRARY(spyre, m) {
@@ -330,6 +374,8 @@ TORCH_LIBRARY(spyre, m) {
   m.def(
       "reducescatter_run(Tensor input, int plan_handle, int group_size) "
       "-> Tensor");
+  m.def("tp_exchange_run(Tensor(a!) input, int plan_handle) -> ()");
+  m.def("tp_part_run(Tensor input, int plan_handle, int part) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(spyre, PrivateUse1, m) {
@@ -338,6 +384,8 @@ TORCH_LIBRARY_IMPL(spyre, PrivateUse1, m) {
   m.impl("allreduce_run", &spyre::rt_ccl::allreduce_run);
   m.impl("allgather_run", &spyre::rt_ccl::allgather_run);
   m.impl("reducescatter_run", &spyre::rt_ccl::reducescatter_run);
+  m.impl("tp_exchange_run", &spyre::rt_ccl::tp_exchange_run);
+  m.impl("tp_part_run", &spyre::rt_ccl::tp_part_run);
 }
 
 namespace c10d {

@@ -89,3 +89,17 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_run"):
         output_size = list(x.shape)
         output_size[0] *= group_size
         return torch.empty(output_size, dtype=x.dtype, device=x.device)
+
+
+# The spyre_rt build's in-graph all-reduce (csrc/distributed_rt/spyre_rt_ccl.cpp):
+# the exchange, then each rank's part read from the window, which the compiled
+# graph sums itself. Only that build registers them.
+if torch._C._dispatch_has_kernel("spyre::tp_part_run"):
+
+    @torch.library.register_fake("spyre::tp_exchange_run")
+    def _(x: torch.Tensor, plan_handle: int) -> None:
+        """In place: x's message is sent; x itself is unchanged."""
+
+    @torch.library.register_fake("spyre::tp_part_run")
+    def _(x: torch.Tensor, plan_handle: int, part: int) -> torch.Tensor:
+        return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)

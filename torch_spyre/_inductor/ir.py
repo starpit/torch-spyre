@@ -804,6 +804,53 @@ class AllReduceKernel(SpyreCollectiveKernel):
         return f"torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
 
 
+class TpExchangeKernel(SpyreCollectiveKernel):
+    """The spyre_rt build's in-graph all-reduce, step 1 of 2.
+
+    ``tp_exchange_run`` puts the input's message in this card's own landing
+    slot and in every peer's, then waits for every peer's. Created with
+    ``create_inplace`` as ``AllReduceKernel`` is: a ``NoneLayout`` node with a
+    ``MutationOutput`` on the input, which orders every part read after it.
+    """
+
+    plan_prefix = "tpx"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        reduce_op, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.allreduce_plan("
+            f"{num_elems}, {dtype_code}, '{reduce_op}', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        return f"torch.ops.spyre.tp_exchange_run({input_name}, {plan_var})"
+
+
+class TpPartKernel(SpyreCollectiveKernel):
+    """The spyre_rt build's in-graph all-reduce, step 2 of 2.
+
+    ``tp_part_run`` gives rank ``part``'s message of the input's last exchange,
+    read from this card's window and laid out as the input: propagate_layouts
+    gives it the input buffer's layouts, as it does ``BroadcastKernel``'s.
+    Created with ``create_out_of_place`` on ``_c10d_functional.broadcast``
+    (same shape, stride and dtype as the input); ``constant_args`` are
+    ``(part, group_name)``. The graph sums the parts itself.
+    """
+
+    plan_prefix = "tpp"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        _, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.allreduce_plan("
+            f"{num_elems}, {dtype_code}, 'sum', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        part, _ = self.constant_args
+        return f"torch.ops.spyre.tp_part_run({input_name}, {plan_var}, {part})"
+
+
 class WaitKernel(ir._WaitKernel):
     """``_c10d_functional.wait_tensor`` — blocks until the collective completes.
 
