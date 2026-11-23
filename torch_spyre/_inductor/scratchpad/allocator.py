@@ -563,15 +563,20 @@ def validated_drain_plans(
         if [op for op in storage_mutators if op is update_op] != [update_op]:
             continue
         post_loop_mutators = [op for op in storage_mutators if op is not update_op]
-        # Every access but the initializer's and the update's.
+        # Every access but the initializer's and the update's.  A write through
+        # a MutationLayout names its own buffer in its dependencies, not the
+        # storage it writes, so the mutators are accesses by membership.
         accessors = [
             op
             for op in graph.operations
             if op is not storage_op
             and op is not update_op
-            and any(
-                dep.name == name
-                for dep in op_read_writes(op).reads | op_read_writes(op).writes
+            and (
+                any(op is mutator for mutator in post_loop_mutators)
+                or any(
+                    dep.name == name
+                    for dep in op_read_writes(op).reads | op_read_writes(op).writes
+                )
             )
         ]
         if any(_access_group_path(op) for op in accessors):

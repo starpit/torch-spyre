@@ -40,13 +40,20 @@ from torch._inductor.ir import (
     StorageBox,
     ReinterpretView,
     Buffer,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
+from torch_spyre._inductor.ir import (
+    AllReduceKernel,
+    FixedTiledLayout,
+    TpExchangeKernel,
+    TpPartKernel,
+    WaitKernel,
+)
 from torch_spyre._inductor.loop_node import (
     all_ops,
     move_after,
@@ -55,13 +62,17 @@ from torch_spyre._inductor.loop_node import (
 )
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
-# In-place collectives whose codegen reads exactly one tensor operand,
-# ``inputs[0]``, and only through ``codegen_reference``/``get_layout``.  The
-# result lives in that operand (``create_inplace`` returns it), so the rewrite
-# repoints the operand, the collective's ``MutationOutput``, its waits and every
-# later reader together.  all_gather and broadcast are out of place and have no
-# test reading a loop carry yet.
-_REWRITABLE_COLLECTIVES = (AllReduceKernel,)
+# Collectives whose codegen reads exactly one tensor operand, ``inputs[0]``, and
+# only through ``codegen_reference``/``get_layout``.  An in-place one's result
+# lives in that operand (``create_inplace`` returns it), so the rewrite repoints
+# the operand, the collective's ``MutationOutput``, its waits and every later
+# reader together.  The spyre_rt build's in-graph all-reduce is three kinds of
+# access of the one operand: TpExchangeKernel (in place, as AllReduceKernel),
+# one TpPartKernel per rank (out of place; it reads the operand's address and
+# layout), and the last add's whole-buffer write (see
+# ``_is_whole_mutation_write``).  all_gather and broadcast are out of place and
+# have no test reading a loop carry yet.
+_REWRITABLE_COLLECTIVES = (AllReduceKernel, TpExchangeKernel, TpPartKernel)
 
 
 def unwrapped_buffer_name(node: Any) -> str | None:
@@ -503,9 +514,27 @@ class GraphEditor:
             return True
         if isinstance(op, WaitKernel):
             return GraphEditor._sole_operand_name(op) == name
+        if GraphEditor._is_whole_mutation_write(op, name):
+            return True
         return (
             GraphEditor.is_rewritable_consumer(op)
             and name not in op.get_mutation_names()
+        )
+
+    @staticmethod
+    def _is_whole_mutation_write(op: Operation, name: str) -> bool:
+        """A Pointwise loop that writes ``name`` through a ``MutationLayout``
+        and does not read it: retargeting the layout at another buffer of the
+        same addressing is its whole rewrite.  The spyre_rt build's in-graph
+        all-reduce writes its sum back this way (lowering's
+        ``_build_mutation_lowering``)."""
+        layout = getattr(op, "layout", None)
+        return (
+            GraphEditor.is_rewritable_consumer(op)
+            and isinstance(op.data, Pointwise)
+            and isinstance(layout, MutationLayoutSHOULDREMOVE)
+            and layout.get_buffer().get_name() == name
+            and name not in op.get_read_names()
         )
 
     def replace_post_loop_accesses(
@@ -529,7 +558,9 @@ class GraphEditor:
                 )
         new_name = new.get_name()
         for op in accesses:
-            if self.is_rewritable_consumer(op):
+            if self._is_whole_mutation_write(op, old_name):
+                self._retarget_mutation_write(op, old_name, new)
+            elif self.is_rewritable_consumer(op):
                 self._replace_loop_input(op, old_name, new_name)
             else:
                 self._replace_sole_operand(op, old_name, new)
@@ -588,6 +619,28 @@ class GraphEditor:
             self.lowering.mutated_buffers.add(new_name)
         invalidate_op_read_writes(op)
         op.get_free_symbol_uses.clear_cache(op)
+
+    def _retarget_mutation_write(
+        self, op: Operation, old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Point a whole-buffer mutation write of ``old_name`` at ``new``."""
+        old_layout = op.layout.get_buffer().get_layout()
+        new_layout = new.get_layout()
+        if (
+            old_layout.dtype != new_layout.dtype
+            or list(old_layout.size) != list(new_layout.size)
+            or list(old_layout.stride) != list(new_layout.stride)
+            or old_layout.offset != new_layout.offset
+            or getattr(old_layout, "device_layout", None)
+            != getattr(new_layout, "device_layout", None)
+        ):
+            raise ValueError(
+                f"{new.get_name()} is not addressing-equivalent to {old_name}"
+            )
+        op.layout = MutationLayoutSHOULDREMOVE(new)
+        # As _replace_sole_operand: old_name stays in mutated_buffers.
+        self.lowering.mutated_buffers.add(new.get_name())
+        invalidate_op_read_writes(op)
 
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str
