@@ -19,11 +19,14 @@
 #include <ATen/core/CachingHostAllocator.h>
 
 #include <cstddef>
-#include <flex/flex.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+
+#ifdef TORCH_SPYRE_FLEX
+
+#include <flex/flex.hpp>
 
 namespace spyre {
 
@@ -83,3 +86,5 @@ class SpyrePinnedAllocator : public at::HostAllocator {
 at::HostAllocator* GetSpyrePinnedAllocator();
 
 }  // namespace spyre
+
+#endif  // TORCH_SPYRE_FLEX

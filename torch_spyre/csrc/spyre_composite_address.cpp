@@ -26,10 +26,8 @@ namespace {
 
 // Storage-level safety checks: on-device, non-null storage and context.
 // Contiguity is NOT checked here -- a non-contiguous view of a Spyre tensor
-// still shares its storage's CompositeAddress with the base allocation, and
-// C++ callers (D2H copies of transposed views, etc.) legitimately need it.
-// The Python handle path layers a contiguity check on top for callers that
-// want a well-defined chunk geometry.
+// still shares its storage's device view with the base allocation, and C++
+// callers (D2H copies of transposed views, etc.) legitimately need it.
 SharedOwnerCtx* resolve_owner_ctx(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone(),
               "get_composite_address: tensor must be on the Spyre device");
@@ -47,54 +45,52 @@ SharedOwnerCtx* resolve_owner_ctx(const at::Tensor& tensor) {
 
 }  // namespace
 
+spyre_rt::DeviceView* get_composite_address(const at::Tensor& tensor) {
+  auto* ctx = resolve_owner_ctx(tensor);
+  // Sharded storage is a set of independently placed chunks, not one device
+  // allocation. Kernels, fills, and device-to-device copies that take a single
+  // view cannot consume it; fail here rather than let them address only part
+  // of the tensor. Host copies go through per-shard views instead.
+  TORCH_CHECK(!ctx->sharding.has_value(),
+              "this operation does not support sharded Spyre tensors yet "
+              "(sharded storage can only be copied to or from the CPU)");
+  return &ctx->view;
+}
+
+#ifdef TORCH_SPYRE_FLEX
+
 CompositeAddressHandle::CompositeAddressHandle(const at::Tensor& tensor)
-    // Keepalive: retain the tensor's storage so the SharedOwnerCtx below (and
-    // the CompositeAddress it owns) cannot be freed while this handle lives.
-    : storage_(tensor.storage()), composite_addr_([&]() {
+    // Keepalive: retain the tensor's storage so the SharedOwnerCtx below
+    // (and the view it caches) cannot be freed while this handle lives.
+    : storage_(tensor.storage()), view_([&]() {
         TORCH_CHECK(tensor.is_contiguous(),
                     "get_composite_address: tensor must be contiguous");
         // Same fail-closed rule as get_composite_address: sharded storage is
         // several independently placed chunks, not one device allocation.
-        return get_composite_address(tensor);
+        return *get_composite_address(tensor);
       }()) {}
 
-flex::CompositeAddress* get_composite_address(const at::Tensor& tensor) {
-  auto* ctx = resolve_owner_ctx(tensor);
-  // Sharded storage is a set of independently placed chunks, not one device
-  // allocation. Kernels, fills, and device-to-device copies that take a single
-  // CompositeAddress cannot consume it; fail here rather than let them address
-  // only part of the tensor. Host copies go through per-shard views instead.
-  TORCH_CHECK(!ctx->sharding.has_value(),
-              "this operation does not support sharded Spyre tensors yet "
-              "(sharded storage can only be copied to or from the CPU)");
-  return &ctx->composite_addr;
-}
-
 size_t CompositeAddressHandle::total_size() const {
-  return composite_addr_->total_size();
+  return view_.size.raw;
 }
 
 size_t CompositeAddressHandle::num_chunks() const {
-  return composite_addr_->chunks().size();
+  return 1;
 }
 
 std::vector<CompositeChunkInfo> CompositeAddressHandle::chunks() const {
-  const auto& chunks = composite_addr_->chunks();
-  std::vector<CompositeChunkInfo> out;
-  out.reserve(chunks.size());
-  for (const auto& chunk : chunks) {
-    out.push_back(CompositeChunkInfo{
-        /*region_id=*/chunk.addr.region_id,
-        /*offset=*/chunk.addr.offset,
-        /*size=*/chunk.size,
-        /*domain_id=*/chunk.domain_id,
-    });
-  }
-  return out;
+  return {CompositeChunkInfo{
+      /*region_id=*/view_.region.raw,
+      /*offset=*/view_.offset.raw,
+      /*size=*/view_.size.raw,
+      /*domain_id=*/view_.domain.raw,
+  }};
 }
 
 CompositeAddressHandle get_composite_address_handle(const at::Tensor& tensor) {
   return CompositeAddressHandle(tensor);
 }
+
+#endif  // TORCH_SPYRE_FLEX
 
 }  // namespace spyre

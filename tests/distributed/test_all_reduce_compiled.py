@@ -81,6 +81,11 @@ except ValueError:
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 _GROUP_NAME = "default"
+# The compiled all_reduce's run call. With spyre-comms it is allreduce_run. The
+# spyre_rt build (which registers spyre::tp_part_run) sums the parts in the graph
+# itself: tp_exchange_run, then one tp_part_run per rank, then the graph's adds.
+_IN_GRAPH_SUM = torch._C._dispatch_has_kernel("spyre::tp_part_run")
+_AR_RUN = "tp_exchange_run(" if _IN_GRAPH_SUM else "allreduce_run("
 
 
 class AllReduceModule(torch.nn.Module):
@@ -310,15 +315,31 @@ class TestAllReduceCompiled(TestCase):
             result, (code, *_) = run_and_get_code(torch.compile(late), x, w, y)
 
         body = code[code.index("def call") :].splitlines()
-        run = next(i for i, line in enumerate(body) if "allreduce_run(" in line)
+        run = next(i for i, line in enumerate(body) if _AR_RUN in line)
         wait = next(i for i, line in enumerate(body) if "wait_work(" in line)
-        between = [line for line in body[run + 1 : wait] if ".run(" in line]
-        self.assertEqual(
-            len(between), 1, "expected relu(y @ w) between run and wait:\n" + code
-        )
-        # The hoisted kernel must not read the collective's buffer.
-        reduced = re.search(r"allreduce_run\((\w+),", body[run]).group(1)
-        self.assertNotIn(reduced, between[0])
+        kernels_between = [line for line in body[run + 1 : wait] if ".run(" in line]
+        if _IN_GRAPH_SUM:
+            # The spyre_rt build's collective ends in its own adds, and the
+            # bundler may put the hoisted kernel in one bundle with the last of
+            # them, so it is not a kernel of its own; the claim is the same:
+            # relu(y @ w) is emitted before the wait, and only the dependent add
+            # after it.
+            self.assertTrue(
+                any("relu" in line for line in kernels_between),
+                "expected relu(y @ w) between run and wait:\n" + code,
+            )
+            after = [line for line in body[wait + 1 :] if ".run(" in line]
+            self.assertEqual(len(after), 1, "expected one kernel after the wait:\n" + code)
+            self.assertNotIn("relu", after[0])
+        else:
+            self.assertEqual(
+                len(kernels_between),
+                1,
+                "expected relu(y @ w) between run and wait:\n" + code,
+            )
+            # The hoisted kernel must not read the collective's buffer.
+            reduced = re.search(r"allreduce_run\((\w+),", body[run]).group(1)
+            self.assertNotIn(reduced, kernels_between[0])
 
         expected = self.comm_size * k * 1e-4 + k * 1e-4
         self.assertTrue(
@@ -488,7 +509,7 @@ class TestAllReduceCompiled(TestCase):
                 msg=f"Rank {self.comm_rank}: {call} call incorrect",
             )
         source = "\n".join(sources)
-        self.assertIn("allreduce_run(", source)
+        self.assertIn(_AR_RUN, source)
         self.assertEqual(_loop_update_allocations(source), ["lx", "lx", "lx"])
 
     def test_allreduce_of_loop_carry_view(self):
@@ -507,7 +528,7 @@ class TestAllReduceCompiled(TestCase):
         )
 
         torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
-        self.assertIn("allreduce_run(", "\n".join(sources))
+        self.assertIn(_AR_RUN, "\n".join(sources))
 
     def test_allreduce_of_squeezed_loop_carry_with_lx_planning(self):
         """The all_reduce_ copy-back writes the carry storage, so the LX planner
@@ -529,7 +550,7 @@ class TestAllReduceCompiled(TestCase):
             )
 
         torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
-        self.assertIn("allreduce_run(", "\n".join(sources))
+        self.assertIn(_AR_RUN, "\n".join(sources))
 
     @parametrize("shape", [(128,), (4, 96)])
     def test_allreduce_compiled_bfloat16(self, shape):

@@ -17,6 +17,7 @@
 #include <ATen/core/CachingHostAllocator.h>
 #include <c10/core/DeviceType.h>
 
+#ifdef TORCH_SPYRE_FLEX
 #include "spyre_pinned_allocator.h"
 
 namespace spyre {
@@ -27,3 +28,4 @@ at::HostAllocatorRegistry<c10::DeviceType::PrivateUse1>
 
 }  // namespace
 }  // namespace spyre
+#endif  // TORCH_SPYRE_FLEX

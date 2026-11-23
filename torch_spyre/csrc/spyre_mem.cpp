@@ -1684,9 +1684,9 @@ at::Tensor spyre_empty_with_layout(
 struct ShardViewCtx {
   SharedOwnerCtx owner;
   c10::Storage parent;
-  ShardViewCtx(flex::CompositeAddress addr, signed char device_id,
+  ShardViewCtx(spyre_rt::DeviceView borrowed_view, signed char device_id,
                c10::Storage parent_storage)
-      : owner(std::move(addr), device_id, flex::MemoryType::Tensor),
+      : owner(borrowed_view, device_id, spyre_rt::MemoryType::Tensor),
         parent(std::move(parent_storage)) {}
 };
 
@@ -1738,12 +1738,10 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 
   c10::DataPtr data_ptr = SpyreAllocator::allocateShardedStorage(
       shard_dim, static_cast<uint32_t>(num_shards), shard_device_bytes);
-  static_cast<SharedOwnerCtx*>(data_ptr.get_context())->sharding->global_shape =
-      size.vec();
-  static_cast<SharedOwnerCtx*>(data_ptr.get_context())->sharding->dtype = dtype;
-  const size_t total_bytes =
-      static_cast<SharedOwnerCtx*>(data_ptr.get_context())
-          ->composite_addr.total_size();
+  auto* owner_ctx = static_cast<SharedOwnerCtx*>(data_ptr.get_context());
+  owner_ctx->sharding->global_shape = size.vec();
+  owner_ctx->sharding->dtype = dtype;
+  const size_t total_bytes = owner_ctx->total_size();
   auto storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), static_cast<int64_t>(total_bytes),
       std::move(data_ptr), &SpyreAllocator::instance());
@@ -1769,6 +1767,10 @@ bool spyre_is_sharded(const at::Tensor& tensor) {
   return ctx != nullptr && ctx->sharding.has_value();
 }
 
+// Sharded path only: its translation bottoms out in device_address, which
+// is not in the spyre_rt bridge, so the whole function stays under the
+// ifdef with the rest of the sharded surface.
+#ifdef TORCH_SPYRE_FLEX
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes) {
@@ -1787,17 +1789,17 @@ uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
               expected_num_shards, " shards");
   // Shard ordinal indexes the shard table directly: shard i backs core i, in
   // an addressable plain allocation of at least one shard.
-  TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_addrs.size(),
+  TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_views.size(),
               "sharded storage has no allocation for shard ", shard_index);
-  flex::Chunk chunk = owner->shard_addrs[shard_index].chunks()[0];
-  TORCH_CHECK(chunk.size >= info.shard_device_bytes, "chunk for shard ",
+  spyre_rt::DeviceView view = owner->shard_views[shard_index];
+  TORCH_CHECK(view.size.raw >= info.shard_device_bytes, "chunk for shard ",
               shard_index, " is not an addressable chunk of one shard");
-  chunk.size = info.shard_device_bytes;
-  // Non-owning single-chunk address, used only for translation; the
-  // tensor (held by the launch) keeps the allocation alive.
-  return SpyreAllocator::instance().compositeAddressToDeviceAddress(
-      flex::CompositeAddress(chunk));
+  view.size = spyre_rt::ByteSize{info.shard_device_bytes};
+  // Non-owning view, used only for translation; the tensor (held by the
+  // launch) keeps the allocation alive.
+  return SpyreAllocator::instance().compositeAddressToDeviceAddress(view);
 }
+#endif  // TORCH_SPYRE_FLEX
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
                               int64_t storage_offset, c10::IntArrayRef size,
@@ -1818,11 +1820,13 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
   return at::cpu::set_(result, storage, storage_offset, size, stride);
 }
 
+#ifdef TORCH_SPYRE_FLEX
 namespace {
 /**
  * Derive the physical byte range of one KV page based on the block_id provided.
  */
-flex::Range derive_kv_page_range(const at::Tensor& cache, size_t block_id) {
+[[maybe_unused]] flex::Range derive_kv_page_range(const at::Tensor& cache,
+                                                  size_t block_id) {
   const SpyreTensorLayout layout = get_spyre_tensor_layout(cache);
   const std::vector<int64_t>& device_size = layout.device_size;
 
@@ -1906,28 +1910,15 @@ flex::Range derive_kv_page_range(const at::Tensor& cache, size_t block_id) {
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
                       const flex::SharedPool& pool, size_t slot_id,
                       bool to_device) {
-  TORCH_CHECK(cache.is_privateuseone(),
-              "copy_kv_page_raw: cache must be a Spyre tensor, got one on ",
-              cache.device());
-  c10::Device device = cache.device();
-  SpyreStream stream = getCurrentStream(device);
-
-  const flex::CompositeAddress* composite_address =
-      spyre::get_composite_address(cache);
-
-  const flex::Range range = derive_kv_page_range(cache, block_id);
-
-  // Owns params so they are destroyed even if launchCopyRaw() throws.
-  std::unique_ptr<flex::CopyRawParams, decltype(&flex::destroyCopyRawParams)>
-      params(flex::createCopyRawParams(&pool, slot_id, composite_address,
-                                       to_device, range),
-             &flex::destroyCopyRawParams);
-  stream.launchCopyRaw(params.get());
-
-  // Always wait: nothing keeps the pool mapped while a DMA is in flight, so
-  // returning early would let the caller detach or destroy it mid-copy.
-  stream.synchronize();
+  // KV-cache offload (raw host-pool DMAs) is not on the chat path and is not
+  // ported to spyre_rt: the runtime has no SharedPool/CopyRaw surface. Fail
+  // loudly rather than silently degrade. Porting it is a later work item
+  // (a raw-copy entry point over device views).
+  TORCH_CHECK(false,
+              "copy_kv_page_raw (KV-cache host-pool offload) is not ported "
+              "to the spyre_rt runtime");
 }
+#endif  // TORCH_SPYRE_FLEX
 
 /**
  * This method handles copy between devices. When copying to Spyre, this method
@@ -1951,15 +1942,15 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
   // The shard table is indexed by shard ordinal by construction: shard i
   // backs core i. Exactly one shard's device bytes from the start of its
   // own allocation.
-  TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_addrs.size(),
+  TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_views.size(),
               "sharded storage has no allocation for shard ", shard_index);
-  flex::Chunk chunk = owner->shard_addrs[shard_index].chunks()[0];
-  TORCH_CHECK(chunk.size >= info.shard_device_bytes, "chunk for shard ",
+  spyre_rt::DeviceView shard_view = owner->shard_views[shard_index];
+  TORCH_CHECK(shard_view.size.raw >= info.shard_device_bytes, "chunk for shard ",
               shard_index, " is too small");
-  chunk.size = info.shard_device_bytes;
+  shard_view.size = spyre_rt::ByteSize{info.shard_device_bytes};
 
-  auto view_ctx = std::make_unique<ShardViewCtx>(
-      flex::CompositeAddress(chunk), owner->device_id, sharded.storage());
+  auto view_ctx = std::make_unique<ShardViewCtx>(shard_view, owner->device_id,
+                                                 sharded.storage());
   view_ctx->owner.shard_view = view_ctx.get();
   void* owner_ctx = static_cast<void*>(&view_ctx->owner);
   c10::DataPtr view_ptr(owner_ctx, owner_ctx, &delete_shard_view,
@@ -2408,20 +2399,20 @@ const at::Tensor& spyre_resize_(
 
 namespace {
 
-// Launch a device-side MEMORY_FILL DMA over one composite address: every
-// stick of it, padding included. createFillAsyncParams converts value to the
-// dtype-specific fill pattern; launchFillAsync submits it.
-void launch_device_fill(const flex::CompositeAddress* addr, double value,
+// Launch a device-side MEMORY_FILL DMA over one device view: every stick of
+// it, padding included. The runtime converts value to the dtype-specific fill
+// pattern (the vendor's createFillAsyncParams).
+void launch_device_fill(const spyre_rt::DeviceView* view, double value,
                         c10::ScalarType scalar_type) {
   // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // flex::createFillAsyncParams performs internally.
+  // the runtime performs internally.
   DataFormats dtype = get_device_dtype(scalar_type);
 
-  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
-  // formats. Zero is the all-zero bit pattern in every format, and the fill
-  // writes raw bytes, so a zero fill of fp8 storage can use any supported
-  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
-  // have, so reject it here instead of failing inside the runtime.
+  // The fill's value->pattern conversion has no fp8 formats. Zero is the
+  // all-zero bit pattern in every format, and the fill writes raw bytes, so a
+  // zero fill of fp8 storage can use any supported format. A nonzero fp8 value
+  // would need an fp8 encoding, which we do not have, so reject it here
+  // instead of failing inside the runtime.
   if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
     TORCH_CHECK(value == 0.0,
                 "fill_ of a float8 Spyre tensor is only supported with the "
@@ -2430,16 +2421,16 @@ void launch_device_fill(const flex::CompositeAddress* addr, double value,
     dtype = DataFormats::SEN169_FP16;
   }
 
-  auto* params =
-      flex::createFillAsyncParams(addr, value, dtype, /*use_dmai=*/true);
-  struct Guard {
-    flex::FillAsyncParams* p;
-    ~Guard() {
-      flex::destroyFillAsyncParams(p);
-    }
-  } guard{params};
+  // One guarded conversion from the deeptools DataFormats discriminant to the
+  // bridge enum that mirrors it.
+  const auto format = static_cast<spyre_rt::DataFormat>(dtype);
+  TORCH_CHECK(static_cast<DataFormats>(format) == dtype,
+              "fill: deeptools DataFormats value ",
+              static_cast<int32_t>(dtype),
+              " has no spyre_rt::DataFormat counterpart");
+
   SpyreStream stream;
-  stream.launchFillAsync(params);
+  stream.fill(*view, value, format);
 }
 
 // Fill a sharded tensor one shard at a time: each shard is its own
@@ -2509,8 +2500,31 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the underlying tensor, or a CPU copy, instead.");
   const at::TensorBase& root =
       self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  // A tensor over a Spyre storage need not be a SpyreTensorImpl: ATen builds a
+  // dtype view (view_dtype, e.g. kv.view(torch.uint8)) as a plain TensorImpl
+  // over the same storage and does not track it as a view, so it is its own
+  // root and carries no layout. The only extent it can be checked against is
+  // its storage's: it must start at storage offset 0 and span every byte, and
+  // then, being dense, it is the whole storage the fill writes.
   const auto* root_impl =
-      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+      dynamic_cast<const SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  if (root_impl == nullptr) {
+    const size_t span_bytes =
+        static_cast<size_t>(self.numel()) * self.element_size();
+    TORCH_CHECK(self.storage_offset() == 0 &&
+                    span_bytes == self.storage().nbytes(),
+                "fill_/zero_ of a partial view of a Spyre tensor is not "
+                "supported yet: the device fill writes whole sticks of the "
+                "storage, so it would also overwrite the bytes outside the "
+                "view (a view with no Spyre layout, such as a dtype view: ",
+                self.sizes(), " of ", self.scalar_type(), " at storage offset ",
+                self.storage_offset(), " spans ", span_bytes, " of the ",
+                self.storage().nbytes(),
+                " storage bytes). Fill the whole tensor, or fill a CPU copy "
+                "and copy it back.");
+    launch_device_fill(get_composite_address(self), value, self.scalar_type());
+    return self;
+  }
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
   if (root_impl->has_intact_reservation()) {
     whole_elements = root.numel();

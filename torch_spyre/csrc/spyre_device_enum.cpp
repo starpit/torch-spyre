@@ -16,35 +16,19 @@
 
 #include "spyre_device_enum.h"
 
-#include <flex/flex.hpp>
+#include "spyre_rt_bridge.h"
 
 namespace spyre {
 
 int getVisibleDeviceCount() {
-  // Get the number of available Spyre devices from the flex runtime.
-  //
-  // This function queries flex::getNumDevices() which determines device count
-  // by:
-  //
-  // 1. For FLEX_DEVICE=PF or VF:
-  //    - Reads total devices in the system without opening any device
-  //    - Adjusts based on AIU_WORLD_SIZE if set (must be <= total devices)
-  //    - If SPYRE_DEVICES is set, parses comma-separated device indices
-  //      and returns the count of valid, unique devices specified
-  //
-  // 2. For FLEX_DEVICE=MOCK:
-  //    - Returns AIU_WORLD_SIZE environment variable value
-  //    - Throws error if AIU_WORLD_SIZE < 1
-  //
-  // Environment Variables:
-  // - AIU_WORLD_SIZE: Number of devices to use (set by the login script and
-  //   matches total devices in most use cases)
-  // - SPYRE_DEVICES: Comma-separated list of device indices to use (e.g.,
-  //   "0,2,3")
-  // - FLEX_DEVICE: Device type ("PF", "VF", or "MOCK")
-  //
-  // @return Number of visible Spyre devices for this process
-  return static_cast<int>(flex::getNumDevices());
+  // Get the number of available Spyre devices from the spyre_rt runtime.
+  // Behaviour is the vendor flex::getNumDevices() (PF/VF: total devices in the
+  // system, adjusted by AIU_WORLD_SIZE and SPYRE_DEVICES; MOCK: AIU_WORLD_SIZE,
+  // error when < 1) — now answered by the spyre-torch crate.
+  return static_cast<int>(
+      spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+        return spyre_rt::num_devices(t);
+      }).raw);
 }
 
 }  // namespace spyre

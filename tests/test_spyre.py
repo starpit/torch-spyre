@@ -330,6 +330,59 @@ class TestSpyre(TestCase):
             page[1].zero_()
         self.assertTrue(page.cpu().float().eq(1).all())
 
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    def test_zero_kv_cache_byte_view(self, dtype):
+        # spyre-inference zeroes each page through a byte view (allocate_pages:
+        # p.view(torch.uint8).zero_()). ATen builds a dtype view as a plain
+        # TensorImpl over the same storage, not tracked as a view, so it has no
+        # Spyre layout: the fill checks it against its storage, which this
+        # unpadded page's byte view spans whole.
+        shape = (3, 2, 16, 128)
+        layout = self._head_major_kv_layout(
+            6, 16, 128, dtype, {(0,): 6, (1,): 16, (2, 3): 128}
+        )
+        page = torch.ones(shape).to(dtype).to("spyre", device_layout=layout)
+        page.view(torch.uint8).zero_()
+        self.assertTrue(page.cpu().float().eq(0).all())
+
+    @parametrize(
+        "view",
+        [
+            # One page of the cache: starts past storage offset 0.
+            subtest(lambda t: t[1].view(torch.uint8), name="one_page"),
+            # Leading pages: storage offset 0, but only part of the storage.
+            subtest(lambda t: t[:1].view(torch.uint8), name="leading_page"),
+        ],
+    )
+    def test_zero_kv_cache_byte_view_partial_rejected(self, view):
+        shape = (3, 2, 16, 128)
+        layout = self._head_major_kv_layout(
+            6, 16, 128, torch.float16, {(0,): 6, (1,): 16, (2, 3): 128}
+        )
+        page = torch.ones(shape).to(torch.float16).to("spyre", device_layout=layout)
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            view(page).zero_()
+        self.assertTrue(page.cpu().float().eq(1).all())
+
+    def test_zero_padded_byte_view_rejected(self):
+        # A byte view of a padded tensor spans its elements' bytes, fewer than
+        # its storage's whole sticks, and has no layout to show it is the whole
+        # tensor, so the fill refuses it rather than guess.
+        d = torch.ones(3, 7, dtype=torch.float16).to("spyre")
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            d.view(torch.uint8).zero_()
+        self.assertTrue(d.cpu().eq(1).all())
+
     def test_fill_float8_nonzero_rejected(self):
         # Only zero is supported (no fp8 fill pattern); it must fail cleanly and
         # leave the tensor untouched.

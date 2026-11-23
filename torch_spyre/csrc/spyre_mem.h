@@ -19,12 +19,16 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
-#include <flex/flex.hpp>
 #include <map>
 #include <optional>
 
 #include "module.h"
+#include "spyre_rt_bridge.h"
 #include "spyre_tensor_impl.h"
+
+#ifdef TORCH_SPYRE_FLEX
+#include <flex/flex.hpp>
+#endif
 
 namespace spyre {
 
@@ -37,12 +41,15 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
+#ifdef TORCH_SPYRE_FLEX
+// KV-cache offload is not on the chat path and is not ported to spyre_rt.
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
                       const flex::SharedPool& pool, size_t slot_id,
                       bool to_device);
+#endif
 
 /**
- * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely
+ * Uses the runtime's device-side fill to perform the fill entirely
  * on-device without allocating a host buffer or performing an H2D DMA.
  *
  * @param self The spyre tensor to fill (in-place)
@@ -123,13 +130,16 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 // Whether `tensor`'s storage is sharded storage.
 bool spyre_is_sharded(const at::Tensor& tensor);
 
+#ifdef TORCH_SPYRE_FLEX
 // Device address of shard `shard_index` of a sharded tensor: the start of
 // that shard's own allocation. Resolved per launch for
 // non-unified kernels; never baked into compiled artifacts. Fails unless the
 // tensor has the shard count and per-shard bytes the kernel was compiled for.
+// Sharded path only: device_address is not in the spyre_rt bridge.
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes);
+#endif  // TORCH_SPYRE_FLEX
 
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, bool host2device)

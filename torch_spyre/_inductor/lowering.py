@@ -61,6 +61,8 @@ from .ir import (
     SpyreEmptyFallback,
     ReduceScatterKernel,
     SpyreReduction,
+    TpExchangeKernel,
+    TpPartKernel,
     WaitKernel,
     copy_back_view,
     get_copy_back_producer,
@@ -3365,12 +3367,55 @@ def lower_c10d_reduce_scatter_coalesced(tensors, reduce_op, group_size, group_na
     return [_reduce_scatter(t, reduce_op, group_size, group_name) for t in tensors]
 
 
+def _in_graph_all_reduce_world(reduce_op, group_name):
+    """The world size when the graph sums this all-reduce itself, else None.
+
+    The spyre_rt build (csrc/distributed_rt) registers ``spyre::tp_part_run``.
+    Its all-reduce (sum) over a group of two ranks or more is an exchange, then
+    every rank's part read from this card's window, summed by the graph in rank
+    order: one kernel with the layouts the graph knows, where eager adds write
+    the default layout and need a copy back.
+    """
+    if reduce_op != "sum" or not torch._C._dispatch_has_kernel("spyre::tp_part_run"):
+        return None
+    from torch.distributed.distributed_c10d import _resolve_process_group
+
+    size = _resolve_process_group(group_name).size()
+    return size if size > 1 else None
+
+
 def _all_reduce_inplace(tensor, reduce_op, group_name):
     mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
     tensor = _realize_collective_input(tensor)
-    AllReduceKernel.create_inplace(
-        _c10d.all_reduce_.default, tensor, reduce_op, group_name
-    )
+    world = _in_graph_all_reduce_world(reduce_op, group_name)
+    if world is None:
+        AllReduceKernel.create_inplace(
+            _c10d.all_reduce_.default, tensor, reduce_op, group_name
+        )
+    else:
+        TpExchangeKernel.create_inplace(
+            _c10d.all_reduce_.default, tensor, reduce_op, group_name
+        )
+        def part(rank):
+            return ir.TensorBox.create(
+                TpPartKernel.create_out_of_place(
+                    _c10d.broadcast.default, tensor, rank, group_name
+                )
+            )
+
+        # One add per buffer: split_multi_ops would split a chain into single-op
+        # buffers itself, and it can only re-derive an op whose inputs have FX
+        # nodes, which the parts (extern outputs) do not. Each part is read
+        # right before its add, so the extern between two adds keeps every add
+        # its own SuperDSC bundle (spyre_fuse_nodes bundles a contiguous run of
+        # device ops; one bundle of world-1 adds was 3x slower than single adds
+        # at 4 rows, tp_compiled_cost.py). The last add writes the collective's
+        # buffer.
+        total = part(0)
+        for rank in range(1, world - 1):
+            total = lowering.add(total, part(rank))
+            total.realize()
+        _build_mutation_lowering(lowering.add(total, part(world - 1)), tensor)
     if mutation_target is not None:
         # Tag the temporary buffer the kernel mutates; the wait lowering finds
         # it through the waited tensor's alias chain and copies it back.

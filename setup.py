@@ -21,6 +21,8 @@ os.environ.setdefault(
 )  # must be before torch import
 
 import glob
+import json
+import subprocess
 
 from setuptools import Command, setup
 
@@ -40,7 +42,113 @@ def check_libflex():
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
 DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
+# The spyre_rt build's collectives: card to card over the senlib-rs bridge,
+# no collective library. Compiled whenever spyre-comms is not (USE_SPYRE_CCL=0).
+DISTRIBUTED_RT_SRC_DIR = CSRC_DIR / "distributed_rt"
 PROFILER_SRC_DIR = CSRC_DIR / "profiler"
+
+
+# The senlib-rs checkout whose spyre-torch crate this build links (the
+# staticlib with the cxx bridge's Rust half, and everything below it), and
+# the OCO config the recipe of record passes to cargo (the [patch] that
+# redirects the export-controlled stub). Both are REQUIRED inputs with no
+# defaults: this setup.py is the ONE cargo invocation for spyre-torch, so
+# the include dir and the .a the csrc compiles and links against are taken
+# from THAT invocation's build messages — never discovered, guessed, or
+# overridden.
+SENLIB_RS_DIR = Path(os.environ["SENLIB_RS_DIR"])
+OCO_CONFIG = os.environ["OCO"]
+
+
+def build_spyre_torch():
+    """Run the single cargo build of spyre-torch and return (include_dir, a_path).
+
+    `cargo build --release -p spyre-torch --features snt1p0 --config <OCO>
+    --message-format=json-render-diagnostics` is run in the senlib-rs tree.
+    An up-to-date tree is a no-op build that still names its artifacts:
+    cargo emits the build-script-executed and compiler-artifact messages
+    for fresh units too. The include dir comes from the build-script-
+    executed message's out_dir (cxx-build writes the GENERATED bridge
+    header and the version-matched rust/cxx.h under out/cxxbridge/include);
+    the .a comes from the compiler-artifact message for the staticlib.
+    """
+    cmd = [
+        "cargo", "build", "--release", "-p", "spyre-torch",
+        "--features", "snt1p0", "--config", OCO_CONFIG,
+        "--message-format=json-render-diagnostics",
+    ]
+    proc = subprocess.run(
+        cmd, cwd=SENLIB_RS_DIR, capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"cargo build of spyre-torch failed (rc={proc.returncode}):\n"
+            f"{proc.stdout}\n{proc.stderr}"
+        )
+    # A [patch] that cargo silently ignored (wrong path in the OCO config)
+    # builds the export-controlled STUB instead of the real red crate — a
+    # runtime panic, not a build error. Cargo warns "was not used in the
+    # crate graph" on stderr when this happens; that warning is a build
+    # failure here.
+    if "was not used in the crate graph" in (proc.stdout + proc.stderr):
+        raise RuntimeError(
+            "cargo reported a [patch] 'was not used in the crate graph': "
+            "the OCO config's patch path does not match the tree — refusing "
+            "to build (the export-controlled stub would panic at runtime).\n"
+            f"{proc.stderr}"
+        )
+    # The build's own messages, dumped verbatim next to this setup.py for
+    # inspection when a required message is missing (the artifact paths the
+    # build consumed are already taken from this same stdout in-memory).
+    (ROOT_DIR / "cargo-messages.json").write_text(proc.stdout)
+
+    include_dir = None
+    a_path = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # A workspace member's package_id is "path+file://<tree>/crates/
+        # spyre-torch#<version>" (only registry deps front their name in
+        # package_id), and build-script-executed messages carry NO
+        # manifest_path — so package_id is the one field that identifies
+        # spyre-torch in every message kind.
+        package_id = msg.get("package_id", "")
+        if "crates/spyre-torch#" not in package_id:
+            continue
+        reason = msg.get("reason")
+        if reason == "build-script-executed":
+            out_dir = msg.get("out_dir")
+            if out_dir:
+                include_dir = Path(out_dir) / "cxxbridge" / "include"
+        elif reason == "compiler-artifact":
+            # The package_id filter above already scopes to spyre-torch;
+            # its lib target is named spyre_torch (underscore) with kind
+            # ["staticlib", "rlib"].
+            target = msg.get("target", {})
+            if "staticlib" in target.get("kind", []):
+                for f in msg.get("filenames", []):
+                    if f.endswith(".a"):
+                        a_path = Path(f)
+    if include_dir is None:
+        raise RuntimeError(
+            "the cargo build of spyre-torch emitted no build-script-executed "
+            "message with an out_dir: no cxxbridge include dir to compile the "
+            "csrc against"
+        )
+    if a_path is None:
+        raise RuntimeError(
+            "the cargo build of spyre-torch emitted no compiler-artifact "
+            "message for its staticlib: no libspyre_torch.a to link"
+        )
+    return include_dir, a_path
+
+
+CXXBRIDGE_INCLUDE, SPYRE_TORCH_A = build_spyre_torch()
 
 
 # Automatically download json.hpp if not present
@@ -65,9 +173,25 @@ def maybe_download_nlohmann_json():
 
 INCLUDE_DIRS = [
     CSRC_DIR,
+    # The cxx-build output of THE cargo build this setup.py ran: the
+    # GENERATED bridge header (spyre-torch/src/bridge.rs.h — the API the
+    # whole csrc calls) and the version-matched rust/cxx.h (the crate pins
+    # cxx =1.0.205). Taken from the build's own messages; nothing is
+    # vendored, discovered, or overridden.
+    CXXBRIDGE_INCLUDE,
+    # The generated header does #include "spyre-torch/include/spyre_torch.h"
+    # (the crate's consumer-contract header, which names the deeptools types
+    # the bridge passes through and the memory-pressure callback), rooted at
+    # the crates dir of the senlib-rs checkout.
+    SENLIB_RS_DIR / "crates",
     # "tracy/public"
 ]
-LIBRARY_DIRS = []
+LIBRARY_DIRS = [
+    # The spyre-torch staticlib (the cxx bridge's Rust half, with everything
+    # below it: flex-rs, senlib-rs, the export-controlled values), from the
+    # same cargo build's compiler-artifact message.
+    SPYRE_TORCH_A.parent,
+]
 
 
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
@@ -100,6 +224,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
         DEEPTOOLS_DIR / "include",
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+    LIBRARY_DIRS += [DEEPTOOLS_DIR / "lib"]
 
 # The USE_SPYRE_CCL environment variable can be used to build torch-spyre
 # without support for Multi-Spyre. This is for developers only.
@@ -139,7 +264,14 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-LIBRARIES = ["flex"]
+# The spyre_rt build links no flex: the csrc talks to the Rust runtime
+# through the spyre-torch crate's cxx bridge (libspyre_torch.a, the
+# staticlib) and to deeptools directly for the pieces the csrc itself uses
+# (sendefs, sen_data_convert, spyrecode-host-functions). Link order in the
+# extension link line: -lspyre_torch comes after these; the staticlib
+# leaves spyre_rt::on_memory_pressure undefined by design — the csrc
+# defines it, and the link fails by name if it does not.
+LIBRARIES = ["spyrecode-host-functions", "util", "spyre_torch"]
 
 
 if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
@@ -214,7 +346,9 @@ if __name__ == "__main__":
             list(PROFILER_SRC_DIR.glob("*.cpp")) if COMPILE_AIUPTI else []
         )
         distributed_sources = (
-            list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
+            list(DISTRIBUTED_SRC_DIR.glob("*.cpp"))
+            if use_spyre_ccl
+            else list(DISTRIBUTED_RT_SRC_DIR.glob("*.cpp"))
         )
 
         core_src_paths = [p.relative_to(ROOT_DIR).as_posix() for p in sorted(sources)]
@@ -234,8 +368,13 @@ if __name__ == "__main__":
         ]
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
+        else:
+            base_define_macros.append(("USE_SPYRE_RT_CCL", None))
 
-        base_define_macros.append(("USE_FLEX_NAMESPACE", None))
+        # TORCH_SPYRE_FLEX is deliberately NEVER defined in the spyre_rt build:
+        # every flex-only surface (pools, pinned allocator, CopyRaw KV offload,
+        # batched VF corrections, region introspection) lives behind it and
+        # stays uncompiled.
 
         if COMPILE_AIUPTI:
             base_define_macros.append(("HAS_AIUPTI", None))

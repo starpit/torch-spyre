@@ -20,12 +20,13 @@
 #include <c10/core/ScalarType.h>
 #include <c10/core/Stream.h>
 
-#include <flex/flex.hpp>
+#include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
+
+#include "spyre_rt_bridge.h"
 
 namespace spyre {
 
@@ -49,26 +50,53 @@ struct ShardedStorageInfo {
 };
 
 struct SharedOwnerCtx {
-  // Non-sharded storage: the owning allocation. Sharded storage: a non-owning
-  // whole-storage view over the shards' chunks (hand-built, so its destructor
-  // never frees); the owning per-shard allocations live in shard_addrs.
-  flex::CompositeAddress composite_addr;
-  // Sharded storage only: one owning plain allocation per shard, indexed by
-  // shard ordinal (shard i backs core i). Empty for non-sharded storage.
-  std::vector<flex::CompositeAddress> shard_addrs;
+  // The owning device allocation, when this ctx owns one: non-sharded
+  // storage's single allocation. Empty for sharded storage (the owning
+  // per-shard allocations live in shards) and for a ShardViewCtx's owner
+  // (the parent storage keeps the memory alive).
+  std::optional<rust::Box<spyre_rt::Allocation>> allocation;
+  // Cached view of `allocation` (or, for a shard view, of the parent's shard
+  // chunk). Read through get_composite_address(); valid while the storage
+  // that owns this ctx is alive.
+  spyre_rt::DeviceView view;
+  // Sharded storage only: one owning allocation per shard, indexed by shard
+  // ordinal (shard i backs core i), with its cached view in shard_views.
+  // Empty for non-sharded storage.
+  std::vector<rust::Box<spyre_rt::Allocation>> shard_allocations;
+  std::vector<spyre_rt::DeviceView> shard_views;
   signed char device_id;
-  flex::MemoryType memory_type;
+  spyre_rt::MemoryType memory_type;
   // Set only for sharded storage.
   std::optional<ShardedStorageInfo> sharding;
   // Set only on the SharedOwnerCtx embedded in a ShardViewCtx: points back
   // at the enclosing view so the view's DataPtr deleter can free it.
   ShardViewCtx* shard_view = nullptr;
 
-  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id,
-                 flex::MemoryType mem_type)
-      : composite_addr(std::move(addr)),
+  // Total physical device bytes: the whole allocation, or the sum over the
+  // shard table. The vendor's CompositeAddress::total_size().
+  uint64_t total_size() const {
+    if (allocation.has_value()) {
+      return view.size.raw;
+    }
+    uint64_t total = 0;
+    for (const auto& v : shard_views) {
+      total += v.size.raw;
+    }
+    return total;
+  }
+
+  SharedOwnerCtx(rust::Box<spyre_rt::Allocation> alloc, signed char dev_id,
+                 spyre_rt::MemoryType mem_type)
+      : allocation(std::move(alloc)),
+        view(allocation.has_value() ? (*allocation)->view()
+                                    : spyre_rt::DeviceView{}),
         device_id(dev_id),
         memory_type(mem_type) {}
+
+  // For a shard view's non-owning owner: borrows the shard's view.
+  SharedOwnerCtx(spyre_rt::DeviceView borrowed_view, signed char dev_id,
+                 spyre_rt::MemoryType mem_type)
+      : view(borrowed_view), device_id(dev_id), memory_type(mem_type) {}
 };
 
 // A custom allocator for our custom device, which returns a handle to the
@@ -80,13 +108,6 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   static c10::CachingDeviceAllocator::StatTypes
       stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
   static std::mutex stats_mutex_;
-
-  static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
-
-  // Memory pressure callback for FlexAllocator
-  // Invoked when allocator exhausts all regions
-  // Releases mutex, triggers Python GC, re-acquires mutex
-  static void memoryPressureCallback(std::unique_lock<std::mutex>& lock);
 
  public:
   static SpyreAllocator& instance();
@@ -106,18 +127,21 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   void resetPeakStats(c10::DeviceIndex device) override;
 
   void recordAlloc(size_t nbytes, void* data, int device,
-                   flex::MemoryType memory_type);
+                   spyre_rt::MemoryType memory_type);
 
   void recordRelease(size_t nbytes, void* data, int device,
-                     flex::MemoryType memory_type);
+                     spyre_rt::MemoryType memory_type);
 
   c10::DataPtr allocate(size_t nbytes) override;
 
-  c10::DataPtr allocate(size_t nbytes,
-                        const flex::AllocationDirective& directive);
+  // Typed allocation through spyre_rt: the vendor's AllocationDirective
+  // (PlacementPolicy::Bind over an explicit domain list) reduced to its
+  // (memory type, domains) content, which is all the csrc ever states.
+  c10::DataPtr allocate(size_t nbytes, spyre_rt::MemoryType memory_type,
+                        const std::vector<spyre_rt::DomainId>& domains);
 
   // Allocate sharded storage: num_shards plain per-shard allocations of
-  // shard_device_bytes, shard i bound to Flex memory domain
+  // shard_device_bytes, shard i bound to memory domain
   // i % num_memory_domains, tagged with the sharding record. The returned
   // DataPtr owns them through a SharedOwnerCtx.
   static c10::DataPtr allocateShardedStorage(int64_t shard_dim,
@@ -130,8 +154,13 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   void copy_data(void* dest, const void* src, std::size_t count) const final;
 
+#ifdef TORCH_SPYRE_FLEX
+  // The vendor's compositeAddressToDeviceAddress: the device-addressable
+  // (segment) address of a view. Sharded path only; device_address is not
+  // in the spyre_rt bridge, so the whole translation stays under the ifdef.
   uint64_t compositeAddressToDeviceAddress(
-      const flex::CompositeAddress& addr) const;
+      const spyre_rt::DeviceView& view) const;
+#endif  // TORCH_SPYRE_FLEX
 };
 
 }  // namespace spyre

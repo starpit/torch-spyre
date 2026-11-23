@@ -49,39 +49,55 @@ class SpyreStream {
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,
-                        const flex::CompositeAddress* device_address) const;
+                        const spyre_rt::DeviceView* device_address) const;
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args,
               std::vector<SymbolicArg> symbolic_args = {}) const;
 
-  // Typed flex operation launches. These are the single chokepoint through
-  // which torch-spyre submits work to the underlying flex stream; the raw
-  // flex::RuntimeStream handle never escapes SpyreStream.
-  void launchH2D(flex::DmaParams* params) const;
-  void launchD2H(flex::DmaParams* params) const;
-  void launchCompute(flex::ComputeParams* params) const;
-  void launchHostCallback(flex::HostCallbackParams* params) const;
-  // Device-side MEMORY_FILL DMA. Routes through the typed
-  // flex::RuntimeStream::launchOperation(FillAsyncParams*) wrapper, which
-  // performs the value->pattern conversion internally.
-  void launchFillAsync(flex::FillAsyncParams* params) const;
-  void launchCopyRaw(flex::CopyRawParams* params) const;
-  // Host-side compute for deeptools host compute calls.
-  flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
+  // The typed spyre_rt entry points JobPlan steps call at launch time. These
+  // are the single chokepoint through which torch-spyre submits work to the
+  // runtime; the raw spyre_rt::Stream handle never escapes SpyreStream.
+  // The barrier argument is the caller step's pipeline_barrier_ flag.
+  void copyH2D(const uint8_t* src, spyre_rt::ByteSize src_capacity,
+               spyre_rt::DeviceView dst, spyre_rt::PipelineBarrier barrier) const;
+  void copyD2H(spyre_rt::DeviceView src, uint8_t* dst,
+               spyre_rt::ByteSize dst_capacity,
+               spyre_rt::PipelineBarrier barrier) const;
+  void launchComputeStep(
+      spyre_rt::DeviceView program, spyre_rt::BootstrapOffset bootstrap,
+      rust::Slice<const spyre_rt::DeviceView> tensors, rust::Str name,
+      spyre_rt::PipelineBarrier barrier) const;
+  void uploadCorrectionsStep(spyre_rt::CorrectionsHandle corrections,
+                             spyre_rt::DeviceView dst,
+                             spyre_rt::PipelineBarrier barrier) const;
+  spyre_rt::CorrectionsHandle hostComputeStep(
+      const spyre_rt::HostComputeHandle& handle,
+      spyre_rt::ByteSize correction_size, const uint8_t* input,
+      rust::Slice<const spyre_rt::HostComputeArg> args) const;
+  // Device-side fill (the vendor's FillAsync MEMORY_FILL DMA).
+  void fill(spyre_rt::DeviceView dst, double value,
+            spyre_rt::DataFormat format) const;
+
+  // Tensor parallelism (spyre_rt): send `src` card to card to rank `to` at
+  // `parity`, and hold this stream until every peer's message at `parity`
+  // has landed (distributed_rt/spyre_rt_ccl.cpp).
+  void tpSend(const spyre_rt::Runtime& rt, uint8_t to, uint8_t parity,
+              spyre_rt::DeviceView src) const;
+  void tpWait(const spyre_rt::Runtime& rt, uint8_t parity) const;
 
   // Conversions
   c10::Stream unwrap() const;
 
   // Returns the error state of this stream without exposing the underlying
-  // flex::RuntimeStream handle to callers.
+  // runtime handle to callers.
   SpyreStreamError getError() const;
 
  private:
-  flex::RuntimeStream* resolveRuntimeHandle() const;
+  const spyre_rt::Stream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
-                     const flex::CompositeAddress* device_address,
+                     const spyre_rt::DeviceView* device_address,
                      const DataConversionInfo* dci, bool host2device,
-                     std::shared_ptr<void> host_lifetime = nullptr) const;
+                     std::unique_ptr<spyre_rt::HostKeepAlive> keep = nullptr) const;
 };
 
 /**
@@ -129,13 +145,13 @@ SpyreStream getHostComputeStreamById(
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**
- * Get the Flex-level default stream for a device.
+ * Get the runtime-level default stream for a device.
  * The default stream is stream ID 0 and is always available.
  *
  * @param device Device to get default stream for
- * @return The default Flex RuntimeStream (stream ID 0)
+ * @return The default runtime Stream (stream ID 0)
  */
-flex::RuntimeStream* getDefaultStreamRuntimeHandle(
+const spyre_rt::Stream* getDefaultStreamRuntimeHandle(
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**

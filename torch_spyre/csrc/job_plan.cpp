@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -29,76 +30,83 @@
 
 namespace spyre {
 
+namespace {
+// The step's pipeline_barrier_ flag mapped onto the bridge enum.
+inline spyre_rt::PipelineBarrier step_barrier(bool enabled) {
+  return enabled ? spyre_rt::PipelineBarrier::Yes : spyre_rt::PipelineBarrier::No;
+}
+
+// Debug printing of a DeviceView. to_string is not in the bridge (the API's
+// Display for DeviceView was cut with it), so the operator<< sites format
+// the fields themselves — debug only, never on the launch path.
+std::string view_to_string(const spyre_rt::DeviceView& view) {
+  std::ostringstream os;
+  os << "{region=" << view.region.raw << " offset=" << view.offset.raw
+     << " size=" << view.size.raw << " domain=" << view.domain.raw << "}";
+  return os.str();
+}
+}  // namespace
+
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
-  auto* params =
-      flex::createDmaParams(host_address_, device_address_.total_size(),
-                            /*to_device=*/true, &device_address_);
-  params->pipeline_barrier = pipeline_barrier_;
-  stream.launchH2D(params);
-  flex::destroyDmaParams(params);
+  // The vendor's plain createDmaParams (no host capacity): the JobPlan owns
+  // the pinned host buffer and outlives the in-flight DMA, and the buffer
+  // provably matches the device allocation, so src_capacity is the device
+  // size (the vendor validators check dma_size <= capacity only).
+  stream.copyH2D(static_cast<const uint8_t*>(host_address_),
+                 device_address_.size, device_address_, step_barrier(pipeline_barrier_));
 }
 
 void JobPlanStepH2D::write(std::ostream& os) const {
   os << "  H2D (Host-to-Device)\n";
   os << "    Host address: " << host_address_ << "\n";
-  os << "    Device CompositeAddress: " << device_address_ << "\n";
+  os << "    Device view: "
+     << std::string(view_to_string(device_address_)) << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
 
 void JobPlanStepD2H::construct(LaunchContext& ctx,
                                const SpyreStream& stream) const {
-  if (std::holds_alternative<flex::CompositeAddress>(device_address_)) {
+  if (std::holds_alternative<spyre_rt::DeviceView>(device_address_)) {
     const auto& device_address =
-        std::get<flex::CompositeAddress>(device_address_);
-    auto* params =
-        flex::createDmaParams(host_address_, device_address.total_size(),
-                              /*to_device=*/false, &device_address);
-    params->pipeline_barrier = pipeline_barrier_;
-    stream.launchD2H(params);
-    flex::destroyDmaParams(params);
+        std::get<spyre_rt::DeviceView>(device_address_);
+    stream.copyD2H(device_address, static_cast<uint8_t*>(host_address_),
+                   spyre_rt::ByteSize{size_}, step_barrier(pipeline_barrier_));
   } else {
     const uint64_t device_ptr = std::get<Dmva>(device_address_).value;
-    const auto [segment_id, segment_offset, segment_type] =
-        flex::decodeDevicePointer(device_ptr);
+    const spyre_rt::DecodedPointer decoded =
+        spyre::GlobalRuntime::get()->decode_device_pointer(spyre_rt::DevicePointer{device_ptr});
+    const uint32_t segment_id = decoded.segment.raw;
+    const uint64_t segment_offset = decoded.offset.raw;
     TORCH_CHECK(segment_id < ctx.inputs_outputs.size(),
                 "D2H tensor-segment lookup out of range: segment ", segment_id,
                 " but only ", ctx.inputs_outputs.size(),
                 " launch args were provided");
     const auto& tensor = ctx.inputs_outputs.at(segment_id);
-    const auto& tensor_address = *get_composite_address(tensor);
-    TORCH_CHECK(tensor_address.chunks().size() == 1,
-                "Tensor address must have 1 chunk");
-    const auto& base_chunk = tensor_address.chunks()[0];
-    TORCH_CHECK(segment_offset + size_ <= tensor_address.total_size(),
+    const auto& tensor_view = *get_composite_address(tensor);
+    TORCH_CHECK(segment_offset + size_ <= tensor_view.size.raw,
                 "D2H transfer out of bounds: offset ", segment_offset,
                 " + size ", size_, " exceeds tensor allocation size ",
-                tensor_address.total_size());
-    flex::LogicalAddress offset_addr(base_chunk.addr.region_id,
-                                     base_chunk.addr.offset + segment_offset);
-    flex::Chunk offset_chunk(offset_addr, size_, base_chunk.domain_id);
-
-    // Create shared_ptr to manage lifetime - will be kept alive by callback
-    auto device_address =
-        std::make_shared<flex::CompositeAddress>(offset_chunk);
-
-    auto* params =
-        flex::createDmaParams(host_address_, device_address->total_size(),
-                              /*to_device=*/false, device_address.get());
-    params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*,
-                                        const flex::FlexCallbackMetadata*) {};
-    stream.launchD2H(params);
-    flex::destroyDmaParams(params);
+                tensor_view.size.raw);
+    // Offset view over the tensor's allocation: the vendor's
+    // LogicalAddress/Chunk arithmetic reduced to DeviceView arithmetic.
+    spyre_rt::DeviceView offset_view{
+        tensor_view.region,
+        spyre_rt::ByteOffset{tensor_view.offset.raw + segment_offset},
+        spyre_rt::ByteSize{size_}, tensor_view.domain};
+    stream.copyD2H(offset_view, static_cast<uint8_t*>(host_address_),
+                   spyre_rt::ByteSize{size_}, step_barrier(pipeline_barrier_));
   }
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
   os << "  D2H (Device-to-Host)\n";
-  if (std::holds_alternative<flex::CompositeAddress>(device_address_)) {
-    os << "    Device CompositeAddress: "
-       << std::get<flex::CompositeAddress>(device_address_) << "\n";
+  if (std::holds_alternative<spyre_rt::DeviceView>(device_address_)) {
+    os << "    Device view: "
+       << std::string(view_to_string(
+              std::get<spyre_rt::DeviceView>(device_address_)))
+       << "\n";
   } else {
     os << "    Device dmva: " << std::get<Dmva>(device_address_).value << "\n";
   }
@@ -109,36 +117,36 @@ void JobPlanStepD2H::write(std::ostream& os) const {
 
 void JobPlanStepCompute::construct(LaunchContext& ctx,
                                    const SpyreStream& stream) const {
-  std::vector<const flex::CompositeAddress*> tensor_allocs;
+  // Reuse the launch context's buffer: a launch allocates nothing.
+  auto& tensor_views = ctx.tensor_views;
+  tensor_views.clear();
   if (bind_io_addresses_) {
     for (auto& tensor : ctx.inputs_outputs) {
-      tensor_allocs.push_back(get_composite_address(tensor));
+      tensor_views.push_back(*get_composite_address(tensor));
     }
   }
-  std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
-      params(
-          flex::createComputeParams(&program_address_, std::move(tensor_allocs),
-                                    name_, bootstrap_offset_),
-          flex::destroyComputeParams);
-  params->program_corrections = std::move(ctx.program_corrections);
-  params->pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(params.get());
+  stream.launchComputeStep(
+      program_address_, spyre_rt::BootstrapOffset{bootstrap_offset_},
+      rust::Slice<const spyre_rt::DeviceView>(tensor_views.data(),
+                                              tensor_views.size()),
+      rust::Str(name_), step_barrier(pipeline_barrier_));
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
   os << "    Name: " << (name_.empty() ? "(unnamed)" : name_) << "\n";
-  os << "    Program CompositeAddress: " << program_address_ << "\n";
+  os << "    Program view: "
+     << std::string(view_to_string(program_address_)) << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
 
-std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
+std::vector<spyre_rt::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     const std::vector<at::Tensor>& tensors,
     const std::vector<SymbolicArg>& symbolic_args) {
-  std::vector<flex::HostComputeArg> resolved(symbolic_args.size());
+  std::vector<spyre_rt::HostComputeArg> resolved(symbolic_args.size());
   for (size_t i = 0; i < symbolic_args.size(); ++i) {
     const SymbolicArg& arg = symbolic_args[i];
     TORCH_CHECK(arg.tensor_id >= 0 &&
@@ -146,14 +154,28 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
                 "symbolic_args tensor_id out of range");
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
-        resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        resolved[i] =
+            spyre_rt::host_compute_address(*get_composite_address(tensors[arg.tensor_id]));
         break;
+#ifdef TORCH_SPYRE_FLEX
       case SymbolicArgKind::kShardAddress:
         // dim_index = core (= shard), value = expected per-shard bytes,
         // num_shards = expected shard count; all checked against the tensor.
-        resolved[i] = static_cast<int64_t>(shard_device_address(
-            tensors[arg.tensor_id], arg.dim_index, arg.num_shards, arg.value));
+        resolved[i] = spyre_rt::host_compute_value(
+            static_cast<int64_t>(shard_device_address(tensors[arg.tensor_id],
+                                                      arg.dim_index,
+                                                      arg.num_shards,
+                                                      arg.value)));
         break;
+#else
+      case SymbolicArgKind::kShardAddress:
+        // Sharded host-compute args bottom out in device_address, which is
+        // not in the spyre_rt bridge (sharded path only).
+        TORCH_CHECK(false, "SymbolicArgKind::kShardAddress (sharded "
+                           "host-compute args) is not ported to the spyre_rt "
+                           "bridge");
+        break;
+#endif  // TORCH_SPYRE_FLEX
       case SymbolicArgKind::kDimension: {
         // A varying dimension behind a symbolic loop bound. The bundle
         // declares it as
@@ -190,7 +212,7 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
                       "of the granularity ",
                       arg.granularity, " up to the maximum ", arg.max_value);
         }
-        resolved[i] = size;
+        resolved[i] = spyre_rt::host_compute_value(size);
         break;
       }
       default:
@@ -203,10 +225,11 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
-  std::vector<flex::HostComputeArg> args;
+  auto& args = ctx.host_compute_args;
+  args.clear();
 
   // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
-  // the distinction into HostComputeParams directly.
+  // the distinction into the host-compute call directly.
   if (input_buffer_ == nullptr && !(ishape_.size() == 1 && ishape_[0] == 0)) {
     if (!ctx.symbolic_args.empty()) {
       // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
@@ -214,70 +237,56 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {
-        args.push_back(get_composite_address(tensor));
+        args.push_back(
+            spyre_rt::host_compute_address(*get_composite_address(tensor)));
       }
     }
   }
 
-  auto* params = flex::createHostComputeParams(handle_.get(), correction_size_,
-                                               input_buffer_, std::move(args));
+  // Host compute runs inline on the caller (the vendor's
+  // RuntimeStream::launchOperation(HostComputeParams*) resolves arguments
+  // and calls deeptools::processComputeOnHostCommand[Fast] before
+  // returning, Flex #1990): the bytes are ready before S_dev receives the
+  // consuming compute, regardless of hazard tracking. The runtime owns the
+  // produced Corrections and drops them at upload completion.
+  spyre_rt::CorrectionsHandle corrections =
+      stream.hostComputeStep(
+          *handle_, spyre_rt::ByteSize{correction_size_},
+          static_cast<const uint8_t*>(input_buffer_),
+          rust::Slice<const spyre_rt::HostComputeArg>(args.data(),
+                                                      args.size()));
 
-  struct Guard {
-    flex::HostComputeParams* p;
-    ~Guard() {
-      flex::destroyHostComputeParams(p);
-    }
-  } guard{params};
-
-  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
-  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
-  // before returning this fully written buffer (Flex #1990,
-  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
-  // caller ordering makes the bytes ready before S_dev receives the consuming
-  // ComputeParams, regardless of whether hazard tracking is enabled.
-  // Shared ownership then keeps the bytes alive through upload completion.
-  std::shared_ptr<flex::HostComputeBuffer> host_buffer(
-      stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
-
-  // Enforce that the host buffer correction size matches the expected device
+  // Enforce that the produced correction size matches the expected device
   // allocation size.
-  TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+  TORCH_DCHECK_EQ(spyre_rt::vendor([&](spyre_rt::Thrown& t) {
+                    return GlobalRuntime::get()->corrections_size(t,
+                                                                  corrections);
+                  }).raw,
+                  device_address_.size.raw);
 
+#ifdef TORCH_SPYRE_FLEX
+  // VF-only compound correction submission: PF's maxProgramCorrections() is 0
+  // (the vendor base default, runtime_scheduler.hpp:141), so this branch is
+  // unreachable on PF and the flex ProgramCorrection accumulation it needs is
+  // not ported to spyre_rt. Fail loudly if a VF build ever reaches it rather
+  // than silently dropping the batch.
   if (ctx.batch_program_corrections) {
-    ctx.program_corrections.push_back(
-        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
-                                     device_address_.clone_non_owning())});
-    return;
+    TORCH_CHECK(false,
+                "batched program corrections (VF compound submission) are not "
+                "ported to the spyre_rt runtime; PF never batches "
+                "(maxProgramCorrections() == 0)");
   }
+#endif
 
-  // Create DmaParams to transfer the host buffer.
-  auto* dma_params =
-      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
-                            /*to_device=*/true, &device_address_);
-  dma_params->pipeline_barrier = pipeline_barrier_;
-  // The managed buffer is freed when the callback is destroyed, which happens
-  // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*,
-                                       const flex::FlexCallbackMetadata*) {};
-
-  try {
-    stream.launchH2D(dma_params);
-  }
-  catch (...) {
-    flex::destroyDmaParams(dma_params);
-    throw;
-  }
-  flex::destroyDmaParams(dma_params);
-
-  // managed goes out of scope here, leaving the callback with the only
-  // remaining reference to the host buffer. The buffer will be freed when the
-  // callback is destroyed.
+  stream.uploadCorrectionsStep(corrections, device_address_,
+                               step_barrier(pipeline_barrier_));
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
   os << "    Correction size: " << correction_size_ << " bytes\n";
-  os << "    Device address: " << device_address_ << "\n";
+  os << "    Device address: "
+     << std::string(view_to_string(device_address_)) << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
@@ -287,14 +296,14 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "Total steps: " << plan.steps.size() << "\n";
 
   // Job allocation
-  size_t addr_idx = 0;
-  for (const auto& addr : plan.job_allocation) {
-    if (addr_idx == 0) {
-      os << "Job allocation: " << addr << "\n";
-    } else {
-      os << "Program " << addr_idx - 1 << ": " << addr << "\n";
-    }
-    ++addr_idx;
+  if (!plan.job_allocation.empty()) {
+    os << "Job allocation: "
+       << std::string(view_to_string(plan.job_allocation.front()->view()))
+       << "\n";
+  }
+  for (size_t i = 0; i < plan.program_views.size(); ++i) {
+    os << "Program " << i << ": "
+       << std::string(view_to_string(plan.program_views[i])) << "\n";
   }
 
   // Expected input shapes
